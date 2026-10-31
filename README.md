@@ -1,5 +1,5 @@
 <p>
-  <img src="./assets/img/Pluvora_logo_tr.png" alt="Pluvora Logo" width="250">
+  <img src="./assets/img/pluvora_logo_tr.png" alt="Pluvora Logo" width="250">
 </p>
 
 # Pluvora
