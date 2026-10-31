@@ -54,6 +54,7 @@ pub enum Error {
   UnknownToken,
   UnexpectedEndNode,
   MissingEndToken,
+  MissingReservationTerminator,
   TrailingStructureData,
 }
 
@@ -70,6 +71,7 @@ impl Error {
       Self::InvalidRange => "DTB range is outside the blob",
       Self::InvalidUtf8 => "DTB name is not valid UTF-8",
       Self::MissingNullTerminator => "DTB string has no terminator",
+      Self::MissingReservationTerminator => "missing FDT reservation terminator",
       Self::UnknownToken => "unknown DTB structure token",
       Self::UnexpectedEndNode => "unexpected FDT_END_NODE",
       Self::MissingEndToken => "missing FDT_END token",
@@ -89,6 +91,7 @@ pub struct Dtb<'a> {
   header: Header,
   structure: &'a [u8],
   strings: &'a [u8],
+  reservations: &'a [u8],
 }
 
 impl<'a> Dtb<'a> {
@@ -166,7 +169,11 @@ impl<'a> Dtb<'a> {
 
     let structure = checked_range(blob, structure_offset, structure_size)?;
     let strings = checked_range(blob, strings_offset, strings_size)?;
-    let _ = checked_range(blob, reservation_offset, 16)?;
+    let reservations = blob.get(reservation_offset..).ok_or(Error::InvalidRange)?;
+
+    if reservations.len() < 16 {
+      return Err(Error::InvalidRange);
+    }
 
     let header = Header {
       total_size,
@@ -174,11 +181,19 @@ impl<'a> Dtb<'a> {
       boot_cpu_id,
     };
 
-    Ok(Self {
+    let dtb = Self {
       header,
       structure,
       strings,
-    })
+      reservations,
+    };
+
+    // Validate that a bounded terminator exists during construction.
+    for reservation in dtb.reservations() {
+      reservation?;
+    }
+
+    Ok(dtb)
   }
 
   pub const fn header(&self) -> &Header {
@@ -330,6 +345,82 @@ impl<'a> Iterator for Events<'a> {
     }
     Some(event)
   }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryReservation {
+  pub address: u64,
+  pub size: u64,
+}
+
+pub struct Reservations<'a> {
+  bytes: &'a [u8],
+  cursor: usize,
+  finished: bool,
+}
+
+impl Dtb<'_> {
+  pub fn reservations(&self) -> Reservations<'_> {
+    Reservations {
+      bytes: self.reservations,
+      cursor: 0,
+      finished: false,
+    }
+  }
+}
+
+impl Iterator for Reservations<'_> {
+  type Item = Result<MemoryReservation, Error>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.finished {
+      return None;
+    }
+
+    let end = match self.cursor.checked_add(16) {
+      Some(end) if end <= self.bytes.len() => end,
+      _ => {
+        self.finished = true;
+        return Some(Err(Error::MissingReservationTerminator));
+      }
+    };
+
+    let address = match read_be_u64(self.bytes, self.cursor) {
+      Ok(address) => address,
+      Err(error) => {
+        self.finished = true;
+        return Some(Err(error));
+      }
+    };
+    let size = match read_be_u64(self.bytes, self.cursor + 8) {
+      Ok(size) => size,
+      Err(error) => {
+        self.finished = true;
+        return Some(Err(error));
+      }
+    };
+    self.cursor = end;
+
+    if address == 0 && size == 0 {
+      self.finished = true;
+      return None;
+    }
+
+    if size == 0 || address.checked_add(size).is_none() {
+      self.finished = true;
+      return Some(Err(Error::InvalidRange));
+    }
+
+    Some(Ok(MemoryReservation { address, size }))
+  }
+}
+
+fn read_be_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
+  let end = offset.checked_add(8).ok_or(Error::InvalidRange)?;
+  let raw = bytes.get(offset..end).ok_or(Error::InvalidRange)?;
+  Ok(u64::from_be_bytes([
+    raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+  ]))
 }
 
 fn read_be_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {

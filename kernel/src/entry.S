@@ -21,6 +21,19 @@ _start:
   add   sp, t0, t1
   andi  sp, sp, -16
 
+  # Clear BSS before Rust observes zero-initialized static objects.
+  # Clear byte-by-byte so this remains correct even when __bss_end is not
+  # naturally aligned to a machine word.
+  la    t0, __bss_start
+  la    t1, __bss_end
+
+.Lclear_bss:
+  bgeu  t0, t1, .Lbss_done
+  sb    zero, 0(t0)
+  addi  t0, t0, 1
+  j     .Lclear_bss
+
+.Lbss_done:
   tail  kernel_entry
 
 .Lpark:

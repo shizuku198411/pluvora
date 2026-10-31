@@ -9,6 +9,7 @@ const MAX_DTB_DEPTH: usize = 16;
 
 pub const MAX_HARTS: usize = 64;
 pub const MAX_MEMORY_REGIONS: usize = 8;
+pub const MAX_RESERVED_REGIONS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -22,6 +23,7 @@ pub enum Error {
   MissingBootHart,
   InvalidMemoryRegion,
   OverlappingMemoryRegions,
+  TooManyReservedRegions,
 }
 
 impl Error {
@@ -37,6 +39,7 @@ impl Error {
       Self::MissingBootHart => "boot hart is missing or disabled",
       Self::InvalidMemoryRegion => "invalid physical memory region",
       Self::OverlappingMemoryRegions => "physical memory regions overlap",
+      Self::TooManyReservedRegions => "too many reserved memory regions",
     }
   }
 }
@@ -66,6 +69,8 @@ pub struct PlatformInfo {
   hart_count: usize,
   memory_regions: [MemoryRegion; MAX_MEMORY_REGIONS],
   memory_region_count: usize,
+  reserved_regions: [MemoryRegion; MAX_RESERVED_REGIONS],
+  reserved_region_count: usize,
 }
 
 impl PlatformInfo {
@@ -75,6 +80,8 @@ impl PlatformInfo {
       hart_count: 0,
       memory_regions: [MemoryRegion::EMPTY; MAX_MEMORY_REGIONS],
       memory_region_count: 0,
+      reserved_regions: [MemoryRegion::EMPTY; MAX_RESERVED_REGIONS],
+      reserved_region_count: 0,
     }
   }
 
@@ -91,6 +98,23 @@ impl PlatformInfo {
       .harts()
       .iter()
       .position(|candidate| *candidate == hart_id)
+  }
+
+  pub fn reserved_regions(&self) -> &[MemoryRegion] {
+    &self.reserved_regions[..self.reserved_region_count]
+  }
+
+  fn add_reserved_region(&mut self, region: MemoryRegion) -> Result<(), Error> {
+    if region.size == 0 || region.end().is_none() {
+      return Err(Error::InvalidMemoryRegion);
+    }
+    if self.reserved_region_count == MAX_RESERVED_REGIONS {
+      return Err(Error::TooManyReservedRegions);
+    }
+
+    self.reserved_regions[self.reserved_region_count] = region;
+    self.reserved_region_count += 1;
+    Ok(())
   }
 
   fn add_hart(&mut self, hart_id: usize) -> Result<(), Error> {
@@ -237,6 +261,14 @@ pub fn discover(dtb: &Dtb<'_>, boot_hart: usize) -> Result<PlatformInfo, Error> 
     }
   }
 
+  for reservation in dtb.reservations() {
+    let reservation = reservation?;
+    info.add_reserved_region(MemoryRegion {
+      base: reservation.address,
+      size: reservation.size,
+    })?;
+  }
+
   if info.hart_index(boot_hart).is_none() {
     return Err(Error::MissingBootHart);
   }
@@ -275,13 +307,23 @@ fn finish_node(
   let is_memory = depth == 1 && node.device_type == Some("memory");
   if is_memory && node.enabled() {
     let reg = node.reg.ok_or(Error::InvalidProperty)?;
-    parse_memory_reg(info, node, reg)?;
+    parse_reg_regions(node, reg, |region| info.add_memory_region(region))?;
+  }
+
+  let is_reserved_memory = depth == 2 && parent_name == Some("reserved-memory");
+  if is_reserved_memory && node.enabled() {
+    let reg = node.reg.ok_or(Error::InvalidProperty)?;
+    parse_reg_regions(node, reg, |region| info.add_reserved_region(region))?;
   }
 
   Ok(())
 }
 
-fn parse_memory_reg(info: &mut PlatformInfo, node: NodeState<'_>, reg: &[u8]) -> Result<(), Error> {
+fn parse_reg_regions(
+  node: NodeState<'_>,
+  reg: &[u8],
+  mut add: impl FnMut(MemoryRegion) -> Result<(), Error>,
+) -> Result<(), Error> {
   validate_cell_count(node.parent_address_cells)?;
   validate_cell_count(node.parent_size_cells)?;
 
@@ -301,7 +343,7 @@ fn parse_memory_reg(info: &mut PlatformInfo, node: NodeState<'_>, reg: &[u8]) ->
   while cursor < reg.len() {
     let base = read_cells(reg, &mut cursor, node.parent_address_cells)?;
     let size = read_cells(reg, &mut cursor, node.parent_size_cells)?;
-    info.add_memory_region(MemoryRegion { base, size })?;
+    add(MemoryRegion { base, size })?;
   }
 
   Ok(())
