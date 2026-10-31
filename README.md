@@ -31,6 +31,10 @@ Pluvora is not merely an effort to build a kernel that runs on RISC-V. It is a p
 
 See the [Kernel Design Policy](docs/design/kernel-policy.md) for the complete design.
 
+## Development and Testing
+
+Pluvora provides a reproducible RISC-V development environment through Canonical Workshop. See [Developing and Testing Pluvora](docs/development/getting-started.md) for environment setup, build checks, ELF inspection, and QEMU boot instructions.
+
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and submission guidelines. Please report security vulnerabilities according to [SECURITY.md](SECURITY.md).

@@ -5,6 +5,7 @@ Thank you for your interest in Pluvora. Contributions of code, documentation, te
 ## Before You Start
 
 - Read the [Kernel Design Policy](docs/design/kernel-policy.md).
+- Set up the toolchain and learn the repository's build and QEMU workflow in [Developing and Testing Pluvora](docs/development/getting-started.md).
 - Search existing issues and pull requests before opening a new one.
 - For substantial changes, open a design discussion or proposal issue before implementation.
 - Do not use a public issue to report a security vulnerability. Follow [SECURITY.md](SECURITY.md) instead.
@@ -29,6 +30,15 @@ Contributions should:
 3. Add or update tests and documentation where applicable.
 4. Run all available formatting, build, and test checks.
 5. Open a pull request using the repository template.
+
+The standard local checks use the named actions in `.workshop/kernel-dev.yaml`:
+
+```sh
+workshop run -- build
+workshop run -- run-kernel
+```
+
+Run `workshop run -- check-elf` as well when a change affects the linker script, memory layout, or ELF section permissions. The full setup and test procedure is documented in [Developing and Testing Pluvora](docs/development/getting-started.md).
 
 Commit messages should be concise and use the imperative mood when practical, for example:
 
