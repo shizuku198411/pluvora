@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euxo pipefail
+
+cd /project
+
+# install required pacakges
+sudo apt-get update
+sudo apt-get install -y \
+  make \
+  clang \
+  llvm \
+  qemu-system-misc \
+  qemu-utils \
+  device-tree-compiler \
+  build-essential \
+  libglib2.0-dev \
+  libpixman-1-dev \
+  gcc-riscv64-linux-gnu \
+  gdb-multiarch

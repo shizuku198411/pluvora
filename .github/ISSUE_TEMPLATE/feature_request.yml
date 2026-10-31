@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose an improvement or new capability
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem or limitation should this proposal address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior and design you propose.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and capability implications
+      description: Explain any changes to authority, isolation, object lifetime, or revocation.
+    validations:
+      required: true
+  - type: textarea
+    id: multihart
+    attributes:
+      label: Multi-hart implications
+      description: Explain synchronization, ordering, and cross-hart behavior, or state why they do not apply.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

@@ -1,0 +1,7 @@
+name: kernel-dev-base
+version: "0.1.0"
+summary: kernel development toolchain
+description: |
+  provides the toolchain and runtime dependencies needed to
+  build, test, and run kernel inside a workshop environment.
+license: MIT

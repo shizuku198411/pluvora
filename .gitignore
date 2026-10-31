@@ -1,0 +1,57 @@
+# project
+.workshop.lock
+internaldocs/
+opensbi/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Rust
+target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Build outputs
+build/
+dist/
+out/
+*.o
+*.a
+*.so
+*.elf
+*.bin
+*.map
+
+# Logs / temp files
+*.log
+*.tmp
+*.temp
+.cache/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
