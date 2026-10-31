@@ -120,8 +120,11 @@ impl<'a> Dtb<'a> {
     if total_size < FDT_HEADER_SIZE {
       return Err(Error::BlobTooSmall);
     }
+    if total_size > MAX_DTB_SIZE {
+      return Err(Error::BlobTooLarge);
+    }
 
-    // SAFETY: the caller guarantees that `address` refers to the DTB
+    // SAFETY: the caller guarantees that `address` refers to the DTB.
     let blob = unsafe { slice::from_raw_parts(address as *const u8, total_size) };
     Self::from_bytes(blob)
   }

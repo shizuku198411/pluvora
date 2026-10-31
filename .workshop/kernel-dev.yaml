@@ -19,6 +19,8 @@ actions:
   # build kernel image
   build: |
     cd kernel
+    cargo fmt --check
+    cargo clippy --release -- -D warnings
     cargo build --release
   
   # check elf

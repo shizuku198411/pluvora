@@ -2,11 +2,13 @@
 #![no_std]
 
 mod dtb;
+mod platform;
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
-use dtb::{Dtb, Event};
+use dtb::Dtb;
+use platform::discover;
 
 global_asm!(include_str!("entry.S"));
 
@@ -44,53 +46,39 @@ extern "C" fn kernel_entry(hart_id: usize, dtb_address: usize) -> ! {
   console_write_hex(dtb.header().boot_cpu_id as usize);
   console_putchar(b'\n');
 
-  let mut node_count = 0usize;
-  let mut property_count = 0usize;
-  let mut maximum_depth = 0usize;
-
-  for event in dtb.events() {
-    match event {
-      Ok(Event::BeginNode { depth, name }) => {
-        node_count += 1;
-        maximum_depth = maximum_depth.max(depth);
-
-        // Print only top-level node names.
-        if depth <= 1 {
-          console_write("DTB node: ");
-          if name.is_empty() {
-            console_write("/");
-          } else {
-            console_write(name);
-          }
-          console_putchar(b'\n');
-        }
-      }
-      Ok(Event::Property { depth, name, value }) => {
-        property_count += 1;
-        let _ = (depth, name, value);
-      }
-      Ok(Event::EndNode { depth }) => {
-        let _ = depth;
-      }
-      Ok(Event::End) => break,
-      Err(error) => {
-        console_write("DTB error: ");
-        console_write(error.as_str());
-        console_putchar(b'\n');
-        park()
-      }
+  let platform = match discover(&dtb, hart_id) {
+    Ok(platform) => platform,
+    Err(error) => {
+      console_write("Platform error: ");
+      console_write(error.as_str());
+      console_putchar(b'\n');
+      park();
     }
+  };
+
+  console_write("Hart count: ");
+  console_write_hex(platform.harts().len());
+  console_putchar(b'\n');
+
+  for (index, discovered_hart_id) in platform.harts().iter().enumerate() {
+    console_write("Hart index ");
+    console_write_hex(index);
+    console_write(" -> ID ");
+    console_write_hex(*discovered_hart_id);
+    console_putchar(b'\n');
   }
 
-  console_write("DTB nodes: ");
-  console_write_hex(node_count);
+  console_write("Boot hart index: ");
+  console_write_hex(platform.hart_index(hart_id).unwrap());
   console_putchar(b'\n');
-  console_write("DTB props: ");
-  console_write_hex(property_count);
-  console_putchar(b'\n');
-  console_write("DTB max depth: ");
-  console_write_hex(maximum_depth);
-  console_putchar(b'\n');
+
+  for region in platform.memory_regions() {
+    console_write("Memory base: ");
+    console_write_hex_u64(region.base);
+    console_write(", size: ");
+    console_write_hex_u64(region.size);
+    console_putchar(b'\n');
+  }
 
   park()
 }
@@ -107,6 +95,22 @@ fn console_write_hex(value: usize) {
   console_write("0x");
 
   let mut shift = usize::BITS;
+  while shift != 0 {
+    shift -= 4;
+    let digit = ((value >> shift) & 0xf) as u8;
+    console_putchar(if digit < 10 {
+      b'0' + digit
+    } else {
+      b'a' + digit - 10
+    });
+  }
+}
+
+// initial implementation use only
+fn console_write_hex_u64(value: u64) {
+  console_write("0x");
+
+  let mut shift = u64::BITS;
   while shift != 0 {
     shift -= 4;
     let digit = ((value >> shift) & 0xf) as u8;
