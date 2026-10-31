@@ -1,18 +1,20 @@
 #![no_main]
 #![no_std]
 
+mod dtb;
+
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
-use core::ptr;
+
+use dtb::{Dtb, Event};
 
 global_asm!(include_str!("entry.S"));
 
-const FDT_MAGIC: u32 = 0xd00d_feed;
 const SBI_LEGACY_CONSOLE_PUTCHAR: usize = 1;
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_entry(hart_id: usize, dtb_address: usize) -> ! {
-  console_write("\n[Pluvora] enterd kernel\n");
+  console_write("\n[Pluvora] entered kernel\n");
   console_write("hart ID: ");
   console_write_hex(hart_id);
   console_putchar(b'\n');
@@ -20,26 +22,77 @@ extern "C" fn kernel_entry(hart_id: usize, dtb_address: usize) -> ! {
   console_write_hex(dtb_address);
   console_putchar(b'\n');
 
-  if dtb_has_valid_magic(dtb_address) {
-    console_write("DTB magic: valid\n");
-  } else {
-    console_write("DTB magic: invalid\n");
+  // SAFETY: OpenSBI passes a readable, immutable FDT blob in a1.
+  // Pluvora has not enabled paging or reclaimed boot memory at this point.
+  let dtb = match unsafe { Dtb::from_ptr(dtb_address) } {
+    Ok(dtb) => dtb,
+    Err(error) => {
+      console_write("DTB error: ");
+      console_write(error.as_str());
+      console_putchar(b'\n');
+      park();
+    }
+  };
+
+  console_write("DTB size: ");
+  console_write_hex(dtb.header().total_size);
+  console_putchar(b'\n');
+  console_write("DTB version: ");
+  console_write_hex(dtb.header().version as usize);
+  console_putchar(b'\n');
+  console_write("DTB boot CPU: ");
+  console_write_hex(dtb.header().boot_cpu_id as usize);
+  console_putchar(b'\n');
+
+  let mut node_count = 0usize;
+  let mut property_count = 0usize;
+  let mut maximum_depth = 0usize;
+
+  for event in dtb.events() {
+    match event {
+      Ok(Event::BeginNode { depth, name }) => {
+        node_count += 1;
+        maximum_depth = maximum_depth.max(depth);
+
+        // Print only top-level node names.
+        if depth <= 1 {
+          console_write("DTB node: ");
+          if name.is_empty() {
+            console_write("/");
+          } else {
+            console_write(name);
+          }
+          console_putchar(b'\n');
+        }
+      }
+      Ok(Event::Property { depth, name, value }) => {
+        property_count += 1;
+        let _ = (depth, name, value);
+      }
+      Ok(Event::EndNode { depth }) => {
+        let _ = depth;
+      }
+      Ok(Event::End) => break,
+      Err(error) => {
+        console_write("DTB error: ");
+        console_write(error.as_str());
+        console_putchar(b'\n');
+        park()
+      }
+    }
   }
+
+  console_write("DTB nodes: ");
+  console_write_hex(node_count);
+  console_putchar(b'\n');
+  console_write("DTB props: ");
+  console_write_hex(property_count);
+  console_putchar(b'\n');
+  console_write("DTB max depth: ");
+  console_write_hex(maximum_depth);
+  console_putchar(b'\n');
 
   park()
-}
-
-fn dtb_has_valid_magic(dtb_address: usize) -> bool {
-  if dtb_address == 0 || !dtb_address.is_multiple_of(4) {
-    return false;
-  }
-
-  // SAFETY: OpenSBI supplies a physical pointer to a readable FDT blob in
-  // `a1`. Paging is not enabled yet, so this physical address is directly
-  // addressable. The null and alignment checks above cover pointer validity
-  // requirements that can be checked before parsing the blob.
-  let encoded_magic = unsafe { ptr::read_volatile(dtb_address as *const u32) };
-  u32::from_be(encoded_magic) == FDT_MAGIC
 }
 
 // initial implementation use only
@@ -60,7 +113,7 @@ fn console_write_hex(value: usize) {
     console_putchar(if digit < 10 {
       b'0' + digit
     } else {
-      b'a' + digit -10
+      b'a' + digit - 10
     });
   }
 }
