@@ -1,6 +1,7 @@
 #![no_main]
 #![no_std]
 
+mod arch;
 mod boot;
 mod dtb;
 mod memory;

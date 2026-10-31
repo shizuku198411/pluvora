@@ -2,16 +2,23 @@ mod report;
 
 use core::ptr::addr_of;
 
+use crate::arch::riscv64::paging::{self, KernelLayout};
 use crate::dtb::Dtb;
 use crate::memory::EarlyFrameAllocator;
 use crate::platform::{MemoryRegion, PlatformInfo, discover};
 use crate::support::cpu;
 
-const ALLOCATOR_SMOKE_TEST_FRAMES: usize = 4;
-
 unsafe extern "C" {
   static __kernel_start: u8;
   static __kernel_end: u8;
+  static __text_start: u8;
+  static __text_end: u8;
+  static __rodata_start: u8;
+  static __rodata_end: u8;
+  static __data_start: u8;
+  static __data_end: u8;
+  static __bss_start: u8;
+  static __bss_end: u8;
 }
 
 pub fn run(hart_id: usize, dtb_address: usize) -> ! {
@@ -33,14 +40,15 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
   let mut allocator = EarlyFrameAllocator::new(&platform, kernel_region, dtb_region)
     .unwrap_or_else(|error| fail("Memory", error.as_str()));
 
-  report::allocator_header();
-  for index in 0..ALLOCATOR_SMOKE_TEST_FRAMES {
-    let frame = allocator
-      .allocate_zeroed()
-      .unwrap_or_else(|error| fail("Memory", error.as_str()))
-      .unwrap_or_else(|| fail("Memory", "no free physical frame"));
-    report::allocated_frame(index, frame.start());
-  }
+  let layout = kernel_layout().unwrap_or_else(|| fail("Paging", "invalid kernel layout"));
+  let paging = paging::build(&mut allocator, layout, dtb_region)
+    .unwrap_or_else(|error| fail("Paging", error.as_str()));
+  report::paging(&paging);
+
+  // SAFETY: paging::build identity-maps the currently executing kernel text,
+  // rodata, data, BSS/stack, and the DTB before satp is changed.
+  unsafe { paging::activate(paging) }.unwrap_or_else(|error| fail("Paging", error.as_str()));
+  report::paging_active();
 
   report::complete();
   cpu::park()
@@ -68,6 +76,22 @@ fn dtb_region(dtb_address: usize, dtb_size: usize) -> Option<MemoryRegion> {
   let size = dtb_size as u64;
   base.checked_add(size)?;
   (size != 0).then_some(MemoryRegion { base, size })
+}
+
+fn kernel_layout() -> Option<KernelLayout> {
+  Some(KernelLayout {
+    text: symbol_region(addr_of!(__text_start), addr_of!(__text_end))?,
+    rodata: symbol_region(addr_of!(__rodata_start), addr_of!(__rodata_end))?,
+    data: symbol_region(addr_of!(__data_start), addr_of!(__data_end)),
+    bss: symbol_region(addr_of!(__bss_start), addr_of!(__bss_end))?,
+  })
+}
+
+fn symbol_region(start: *const u8, end: *const u8) -> Option<MemoryRegion> {
+  let start = start as u64;
+  let end = end as u64;
+  let size = end.checked_sub(start)?;
+  (size != 0).then_some(MemoryRegion { base: start, size })
 }
 
 fn fail(stage: &str, message: &str) -> ! {

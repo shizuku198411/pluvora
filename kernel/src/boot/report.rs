@@ -1,3 +1,4 @@
+use crate::arch::riscv64::paging::PagingInfo;
 use crate::dtb::Dtb;
 use crate::platform::{MemoryRegion, PlatformInfo};
 use crate::support::console;
@@ -56,16 +57,16 @@ pub fn memory_map(platform: &PlatformInfo, kernel_region: MemoryRegion, dtb_regi
   region_field("DTB", dtb_region);
 }
 
-pub fn allocator_header() {
-  section("Early Frame Allocator");
+pub fn paging(paging: &PagingInfo) {
+  section("Sv39 Paging");
+  u64_field("Root frame", paging.root_frame());
+  usize_field("Page-table frames", paging.page_table_frames());
+  usize_field("Mapped pages", paging.mapped_pages());
+  console::write_line("  Permissions       : text=R-X rodata=R-- data/bss=RW-");
 }
 
-pub fn allocated_frame(index: usize, address: u64) {
-  console::write("  frame: index=");
-  console::write_hex_usize(index);
-  console::write(", address=");
-  console::write_hex_u64(address);
-  console::newline();
+pub fn paging_active() {
+  console::write_line("  Translation       : active (identity mapped)");
 }
 
 pub fn complete() {
@@ -96,6 +97,15 @@ fn usize_field(label: &str, value: usize) {
   write_padding(label.len());
   console::write(": ");
   console::write_hex_usize(value);
+  console::newline();
+}
+
+fn u64_field(label: &str, value: u64) {
+  console::write("  ");
+  console::write(label);
+  write_padding(label.len());
+  console::write(": ");
+  console::write_hex_u64(value);
   console::newline();
 }
 
