@@ -75,6 +75,13 @@ pub fn trap_ready(stvec: usize) {
   console::write_line("  Mode              : direct");
 }
 
+pub fn hart_bootstrap(boot_index: usize, requested: usize, online: usize) {
+  section("Multi-hart Bootstrap");
+  usize_field("Boot hart index", boot_index);
+  usize_field("Start requests", requested);
+  usize_field("Online count", online);
+}
+
 pub fn complete() {
   section("Status");
   console::write_line("  Early bootstrap completed successfully");

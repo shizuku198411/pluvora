@@ -67,6 +67,7 @@ The current actions are:
 | Action | Purpose |
 | --- | --- |
 | `build` | Check formatting, run Clippy with warnings denied, and create the release kernel image |
+| `format` | Apply Rust formatting fixes to the kernel source tree |
 | `check-elf` | Display the ELF header and program headers with `llvm-readelf` |
 | `run-kernel` | Boot the release kernel with OpenSBI and four QEMU harts |
 | `qemu-boot-test` | Boot OpenSBI without loading the Pluvora kernel image |
@@ -76,6 +77,14 @@ The current actions are:
 | `test-one rust\|qemu [FILTER]` | Select a test category explicitly and optionally apply a name filter |
 
 Workshop parses actions each time `workshop run` is invoked, so changes to an action do not require a refresh of the environment.
+
+If `build` reports formatting differences, apply them with:
+
+```sh
+workshop run -- format
+```
+
+Review the resulting source changes, then run `workshop run -- build` again.
 
 ## Run the Tests
 

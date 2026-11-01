@@ -13,6 +13,7 @@ SECTIONS
     __text_start = .;
     KEEP(*(.text.entry))
     KEEP(*(.text.trap))
+    KEEP(*(.text.secondary))
     *(.text .text.*)
     __text_end = .;
   }

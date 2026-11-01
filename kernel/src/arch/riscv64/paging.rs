@@ -19,9 +19,7 @@ const PTE_EXECUTE: u64 = 1 << 3;
 const PTE_ACCESSED: u64 = 1 << 6;
 const PTE_DIRTY: u64 = 1 << 7;
 
-#[cfg(target_arch = "riscv64")]
 const SATP_MODE_SV39: u64 = 8;
-#[cfg(target_arch = "riscv64")]
 const SATP_MODE_SHIFT: u64 = 60;
 const SATP_PPN_MASK: u64 = (1 << 44) - 1;
 
@@ -103,6 +101,14 @@ impl PagingInfo {
   pub const fn page_table_frames(self) -> usize {
     self.page_table_frames
   }
+
+  pub fn satp_value(self) -> Result<u64, Error> {
+    let root_ppn = self.root_frame >> PAGE_SHIFT;
+    if root_ppn > SATP_PPN_MASK {
+      return Err(Error::InvalidPhysicalAddress);
+    }
+    Ok((SATP_MODE_SV39 << SATP_MODE_SHIFT) | root_ppn)
+  }
 }
 
 pub fn build(
@@ -136,12 +142,7 @@ pub fn build(
 /// before this function writes `satp`.
 #[cfg(target_arch = "riscv64")]
 pub unsafe fn activate(paging: PagingInfo) -> Result<(), Error> {
-  let root_ppn = paging.root_frame >> PAGE_SHIFT;
-  if root_ppn > SATP_PPN_MASK {
-    return Err(Error::InvalidPhysicalAddress);
-  }
-
-  let satp = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | root_ppn;
+  let satp = paging.satp_value()?;
 
   // SAFETY: The caller guarantees that execution can continue using
   // the new identity-mapped address spaces.
@@ -383,5 +384,18 @@ mod tests {
   #[test]
   fn vm_015_alignment_overflow_is_rejected() {
     assert_eq!(align_up(u64::MAX), Err(Error::InvalidRegion));
+  }
+
+  #[test]
+  fn vm_021_satp_encodes_sv39_mode_and_root_ppn() {
+    let paging = PagingInfo {
+      root_frame: 0x0000_0000_8020_0000,
+      mapped_pages: 0,
+      page_table_frames: 0,
+    };
+    assert_eq!(
+      paging.satp_value(),
+      Ok((SATP_MODE_SV39 << SATP_MODE_SHIFT) | 0x80200)
+    );
   }
 }
