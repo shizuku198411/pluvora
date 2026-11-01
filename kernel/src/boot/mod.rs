@@ -3,11 +3,13 @@ mod report;
 use core::ptr::addr_of;
 
 use crate::arch::riscv64::{
+  hart, ipi,
   paging::{self, KernelLayout},
   trap,
 };
 use crate::dtb::Dtb;
 use crate::memory::EarlyFrameAllocator;
+use crate::memory::address_space;
 use crate::platform::{MemoryRegion, PlatformInfo, discover};
 use crate::support::cpu;
 
@@ -52,12 +54,36 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
   // rodata, data, BSS/stack, and the DTB before satp is changed.
   unsafe { paging::activate(paging) }.unwrap_or_else(|error| fail("Paging", error.as_str()));
   report::paging_active();
+  let asid_bits =
+    paging::probe_asid_bits(paging).unwrap_or_else(|error| fail("ASID", error.as_str()));
+  report::asid(asid_bits);
 
   let stvec = trap::install();
+  ipi::enable_local();
   report::trap_ready(stvec);
 
+  let boot_index = hart::initialize_boot_hart(&platform, hart_id)
+    .unwrap_or_else(|error| fail("Harts", error.as_str()));
+  address_space::initialize_allocator(asid_bits)
+    .unwrap_or_else(|error| fail("ASID", error.as_str()));
+  hart::install_kernel_address_space();
+  let requested = hart::start_secondaries(&platform, hart_id, paging)
+    .unwrap_or_else(|error| fail("Harts", error.as_str()));
+  report::hart_bootstrap(boot_index, requested, hart::online_count(&platform));
+
   report::complete();
-  cpu::park()
+  cpu::idle()
+}
+
+pub fn run_secondary(hart_id: usize, hart_index: usize) -> ! {
+  // secondary_entry has already selected the dedicated stack,
+  // installed the shared Sv39 satp, executed SFENCE.VMA,
+  // and set tp to HartLocal.
+  let _stvec = trap::install();
+  ipi::enable_local();
+  hart::install_kernel_address_space();
+  hart::complete_secondary(hart_id, hart_index).unwrap_or_else(|_| cpu::halt());
+  cpu::idle()
 }
 
 fn load_dtb(dtb_address: usize) -> Dtb<'static> {
@@ -102,5 +128,5 @@ fn symbol_region(start: *const u8, end: *const u8) -> Option<MemoryRegion> {
 
 fn fail(stage: &str, message: &str) -> ! {
   report::error(stage, message);
-  cpu::park()
+  cpu::halt()
 }

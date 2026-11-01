@@ -22,6 +22,11 @@ actions:
     cargo fmt --check
     cargo clippy --release -- -D warnings
     cargo build --release
+
+  # apply Rust formatting fixes
+  format: |
+    cd kernel
+    cargo fmt
   
   # check elf
   check-elf: |

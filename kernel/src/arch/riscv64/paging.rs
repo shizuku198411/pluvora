@@ -19,10 +19,10 @@ const PTE_EXECUTE: u64 = 1 << 3;
 const PTE_ACCESSED: u64 = 1 << 6;
 const PTE_DIRTY: u64 = 1 << 7;
 
-#[cfg(target_arch = "riscv64")]
 const SATP_MODE_SV39: u64 = 8;
-#[cfg(target_arch = "riscv64")]
 const SATP_MODE_SHIFT: u64 = 60;
+const SATP_ASID_SHIFT: u64 = 44;
+const SATP_ASID_MASK: u64 = 0xffff;
 const SATP_PPN_MASK: u64 = (1 << 44) - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +35,7 @@ pub enum Error {
   AlreadyMapped,
   LeafWhereTableExpected,
   Sv39NotSupported,
+  InvalidAsidLayout,
 }
 
 impl Error {
@@ -48,6 +49,7 @@ impl Error {
       Self::AlreadyMapped => "virtual page is already mapped",
       Self::LeafWhereTableExpected => "leaf PTE found above level zero",
       Self::Sv39NotSupported => "hart did not accept Sv39 in satp",
+      Self::InvalidAsidLayout => "invalid ASID layout",
     }
   }
 }
@@ -103,6 +105,10 @@ impl PagingInfo {
   pub const fn page_table_frames(self) -> usize {
     self.page_table_frames
   }
+
+  pub fn satp_value(self) -> Result<u64, Error> {
+    satp_value_for(self.root_frame, 0)
+  }
 }
 
 pub fn build(
@@ -136,12 +142,7 @@ pub fn build(
 /// before this function writes `satp`.
 #[cfg(target_arch = "riscv64")]
 pub unsafe fn activate(paging: PagingInfo) -> Result<(), Error> {
-  let root_ppn = paging.root_frame >> PAGE_SHIFT;
-  if root_ppn > SATP_PPN_MASK {
-    return Err(Error::InvalidPhysicalAddress);
-  }
-
-  let satp = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | root_ppn;
+  let satp = paging.satp_value()?;
 
   // SAFETY: The caller guarantees that execution can continue using
   // the new identity-mapped address spaces.
@@ -319,6 +320,69 @@ fn align_up(value: u64) -> Result<u64, Error> {
     .ok_or(Error::InvalidRegion)
 }
 
+pub fn satp_value_for(root_frame: u64, asid: u16) -> Result<u64, Error> {
+  if !root_frame.is_multiple_of(PAGE_SIZE) {
+    return Err(Error::InvalidPhysicalAddress);
+  }
+  let root_ppn = root_frame >> PAGE_SHIFT;
+  if root_ppn > SATP_PPN_MASK {
+    return Err(Error::InvalidPhysicalAddress);
+  }
+  Ok((SATP_MODE_SV39 << SATP_MODE_SHIFT) | (u64::from(asid) << SATP_ASID_SHIFT) | root_ppn)
+}
+
+pub fn is_valid_page_address(virtual_address: u64) -> bool {
+  virtual_address.is_multiple_of(PAGE_SIZE) && is_sv39_canonical(virtual_address)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn probe_asid_bits(paging: PagingInfo) -> Result<u32, Error> {
+  let original = paging.satp_value()?;
+  let probe = original | (SATP_ASID_MASK << SATP_ASID_SHIFT);
+  let observed: u64;
+
+  unsafe {
+    asm!(
+      "csrw satp, {probe}",
+      "csrr {observed}, satp",
+      "csrw satp, {original}",
+      "sfence.vma zero, zero",
+      probe = in(reg) probe,
+      original = in(reg) original,
+      observed = out(reg) observed,
+      options(nostack),
+    );
+  }
+
+  let implemented = (observed >> SATP_ASID_SHIFT) & SATP_ASID_MASK;
+  if implemented != 0 && !implemented.wrapping_add(1).is_power_of_two() {
+    return Err(Error::InvalidAsidLayout);
+  }
+  Ok(implemented.count_ones())
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn fence_page(virtual_address: u64, asid: u16) {
+  unsafe {
+    asm!(
+      "sfence.vma {address}, {asid}",
+      address = in(reg) virtual_address as usize,
+      asid = in(reg) usize::from(asid),
+      options(nostack),
+    )
+  };
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn fence_asid(asid: u16) {
+  unsafe { asm!("sfence.vma zero, {asid}", asid = in(reg) usize::from(asid), options(nostack)) };
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn fence_global() {
+  unsafe { asm!("sfence.vma zero, zero", options(nostack)) };
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -383,5 +447,27 @@ mod tests {
   #[test]
   fn vm_015_alignment_overflow_is_rejected() {
     assert_eq!(align_up(u64::MAX), Err(Error::InvalidRegion));
+  }
+
+  #[test]
+  fn vm_021_satp_encodes_sv39_mode_and_root_ppn() {
+    let paging = PagingInfo {
+      root_frame: 0x0000_0000_8020_0000,
+      mapped_pages: 0,
+      page_table_frames: 0,
+    };
+    assert_eq!(
+      paging.satp_value(),
+      Ok((SATP_MODE_SV39 << SATP_MODE_SHIFT) | 0x80200)
+    );
+  }
+
+  #[test]
+  fn asid_007_satp_encodes_asid_between_mode_and_root_ppn() {
+    assert_eq!(SATP_ASID_MASK, 0xffff);
+    assert_eq!(
+      satp_value_for(0x8020_0000, 0x1234),
+      Ok((SATP_MODE_SV39 << SATP_MODE_SHIFT) | (0x1234 << SATP_ASID_SHIFT) | 0x80200)
+    );
   }
 }

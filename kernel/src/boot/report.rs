@@ -69,10 +69,26 @@ pub fn paging_active() {
   console::write_line("  Translation       : active (identity mapped)");
 }
 
+pub fn asid(bits: u32) {
+  let maximum = if bits == 0 { 0 } else { (1u64 << bits) - 1 };
+  section("Address Spaces");
+  usize_field("ASID bits", bits as usize);
+  u64_field("Maximum ASID", maximum);
+  usize_field("Kernel ASID", 0);
+  u64_field("Generation", 0);
+}
+
 pub fn trap_ready(stvec: usize) {
   section("S-mode traps");
   usize_field("stvec", stvec);
   console::write_line("  Mode              : direct");
+}
+
+pub fn hart_bootstrap(boot_index: usize, requested: usize, online: usize) {
+  section("Multi-hart Bootstrap");
+  usize_field("Boot hart index", boot_index);
+  usize_field("Start requests", requested);
+  usize_field("Online count", online);
 }
 
 pub fn complete() {
