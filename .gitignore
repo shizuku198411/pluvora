@@ -8,7 +8,8 @@ opensbi/
 Thumbs.db
 
 # Editors / IDEs
-.vscode/
+.vscode/*
+!.vscode/settings.json
 .idea/
 *.swp
 *.swo

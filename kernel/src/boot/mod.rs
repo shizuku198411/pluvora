@@ -54,7 +54,6 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
   report::paging_active();
 
   let stvec = trap::install();
-  trap::breakpoint_self_test();
   report::trap_ready(stvec);
 
   report::complete();

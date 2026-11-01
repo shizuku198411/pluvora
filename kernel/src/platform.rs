@@ -104,6 +104,23 @@ impl PlatformInfo {
     &self.reserved_regions[..self.reserved_region_count]
   }
 
+  #[cfg(test)]
+  pub(crate) fn for_test(memory: &[MemoryRegion], reserved: &[MemoryRegion]) -> Self {
+    assert!(memory.len() <= MAX_MEMORY_REGIONS);
+    assert!(reserved.len() <= MAX_RESERVED_REGIONS);
+
+    let mut info = Self::new();
+    for region in memory {
+      info.memory_regions[info.memory_region_count] = *region;
+      info.memory_region_count += 1;
+    }
+    for region in reserved {
+      info.reserved_regions[info.reserved_region_count] = *region;
+      info.reserved_region_count += 1;
+    }
+    info
+  }
+
   fn add_reserved_region(&mut self, region: MemoryRegion) -> Result<(), Error> {
     if region.size == 0 || region.end().is_none() {
       return Err(Error::InvalidMemoryRegion);
@@ -388,4 +405,123 @@ fn read_string(value: &[u8]) -> Result<&str, Error> {
   }
 
   str::from_utf8(&value[..terminator]).map_err(|_| Error::InvalidProperty)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn plat_004_sparse_hart_ids_receive_dense_indices() {
+    let mut info = PlatformInfo::new();
+    info.add_hart(2).unwrap();
+    info.add_hart(17).unwrap();
+    assert_eq!(info.hart_index(2), Some(0));
+    assert_eq!(info.hart_index(17), Some(1));
+    assert_eq!(info.hart_index(3), None);
+  }
+
+  #[test]
+  fn plat_005_duplicate_hart_ids_are_rejected() {
+    let mut info = PlatformInfo::new();
+    info.add_hart(4).unwrap();
+    assert_eq!(info.add_hart(4), Err(Error::DuplicateHart));
+  }
+
+  #[test]
+  fn plat_008_cells_are_read_as_big_endian() {
+    let bytes = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0];
+    let mut cursor = 0;
+    assert_eq!(
+      read_cells(&bytes, &mut cursor, 2),
+      Ok(0x1234_5678_9abc_def0)
+    );
+    assert_eq!(cursor, bytes.len());
+  }
+
+  #[test]
+  fn plat_009_unsupported_cell_count_is_rejected() {
+    let mut cursor = 0;
+    assert_eq!(
+      read_cells(&[0; 12], &mut cursor, 3),
+      Err(Error::UnsupportedCellCount)
+    );
+  }
+
+  #[test]
+  fn plat_011_zero_sized_memory_is_rejected() {
+    let mut info = PlatformInfo::new();
+    assert_eq!(
+      info.add_memory_region(MemoryRegion {
+        base: 0x8000_0000,
+        size: 0,
+      }),
+      Err(Error::InvalidMemoryRegion)
+    );
+  }
+
+  #[test]
+  fn plat_012_memory_end_overflow_is_rejected() {
+    let mut info = PlatformInfo::new();
+    assert_eq!(
+      info.add_memory_region(MemoryRegion {
+        base: u64::MAX - 0xff,
+        size: 0x100,
+      }),
+      Err(Error::InvalidMemoryRegion)
+    );
+  }
+
+  #[test]
+  fn plat_013_overlapping_memory_is_rejected() {
+    let mut info = PlatformInfo::new();
+    info
+      .add_memory_region(MemoryRegion {
+        base: 0x8000_0000,
+        size: 0x2000,
+      })
+      .unwrap();
+    assert_eq!(
+      info.add_memory_region(MemoryRegion {
+        base: 0x8000_1000,
+        size: 0x2000,
+      }),
+      Err(Error::OverlappingMemoryRegions)
+    );
+  }
+
+  #[test]
+  fn plat_014_adjacent_memory_is_not_an_overlap() {
+    let mut info = PlatformInfo::new();
+    info
+      .add_memory_region(MemoryRegion {
+        base: 0x8000_0000,
+        size: 0x1000,
+      })
+      .unwrap();
+    assert!(
+      info
+        .add_memory_region(MemoryRegion {
+          base: 0x8000_1000,
+          size: 0x1000,
+        })
+        .is_ok()
+    );
+  }
+
+  #[test]
+  fn plat_003_enabled_status_values_follow_the_device_tree_contract() {
+    for status in [None, Some("ok"), Some("okay")] {
+      let node = NodeState {
+        status,
+        ..NodeState::EMPTY
+      };
+      assert!(node.enabled());
+    }
+    let disabled = NodeState {
+      status: Some("disabled"),
+      ..NodeState::EMPTY
+    };
+    assert!(!disabled.enabled());
+  }
 }

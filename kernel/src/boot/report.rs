@@ -73,7 +73,6 @@ pub fn trap_ready(stvec: usize) {
   section("S-mode traps");
   usize_field("stvec", stvec);
   console::write_line("  Mode              : direct");
-  console::write_line("  Self-test         : breakpoint handled");
 }
 
 pub fn complete() {
