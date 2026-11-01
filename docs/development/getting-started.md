@@ -70,8 +70,57 @@ The current actions are:
 | `check-elf` | Display the ELF header and program headers with `llvm-readelf` |
 | `run-kernel` | Boot the release kernel with OpenSBI and four QEMU harts |
 | `qemu-boot-test` | Boot OpenSBI without loading the Pluvora kernel image |
+| `test-all` | Run formatting, Clippy, all host-side Rust tests, and all Python-driven QEMU tests |
+| `test-rust [FILTER]` | Run all Rust logic tests or only names containing `FILTER` |
+| `test-qemu [FILTER]` | Run all QEMU integration tests or only names containing `FILTER` |
+| `test-one rust\|qemu [FILTER]` | Select a test category explicitly and optionally apply a name filter |
 
 Workshop parses actions each time `workshop run` is invoked, so changes to an action do not require a refresh of the environment.
+
+## Run the Tests
+
+Run every currently implemented check and test:
+
+```sh
+workshop run -- test-all
+```
+
+Host-side Rust tests cover hardware-independent parsing, range validation, allocation policy, Sv39 encoding, and trap decoding. QEMU tests are driven by Python's standard library and verify the current RV64 boot, paging, and trap smoke-test behavior.
+
+Run one test category:
+
+```sh
+workshop run -- test-rust
+workshop run -- test-qemu
+```
+
+Pass a substring to execute a specific test or group:
+
+```sh
+workshop run -- test-rust dtb_002
+workshop run -- test-qemu trap_q003
+```
+
+The generic action accepts the category as its first argument:
+
+```sh
+workshop run -- test-one rust vm_001
+workshop run -- test-one qemu boot_005
+```
+
+A filter that matches no QEMU test is an error. A QEMU timeout, early emulator exit, kernel panic, boot failure, or fatal trap also fails the relevant test rather than being treated as a successful shutdown.
+
+## Continuous Integration
+
+GitHub Actions runs the same `test-all` Workshop action for every pull request. The workflow is defined in `.github/workflows/test.yml` and uses Canonical's `launch-workshop` action to create an ephemeral `kernel-dev` environment on a GitHub-hosted Ubuntu runner.
+
+The CI job intentionally delegates its checks to the repository's Workshop action:
+
+```sh
+workshop run -- test-all
+```
+
+This keeps formatting, Clippy, Rust logic tests, the release build, and Python-driven QEMU tests consistent between local development and CI. The external GitHub Actions used by the workflow are pinned to commit SHAs; version comments record the corresponding release tags.
 
 ## Build and Check the Kernel
 
@@ -144,10 +193,10 @@ An OpenSBI banner and platform information confirm that the firmware can start o
 Use the following loop for ordinary changes:
 
 1. Edit source files in the host checkout or under `/project` in the workshop.
-2. Run `workshop run -- build`.
-3. Resolve formatting, Clippy, or compiler errors.
+2. Use `workshop run -- test-rust <FILTER>` while iterating on one logic test.
+3. Run `workshop run -- test-all` before submitting the change.
 4. Run `workshop run -- check-elf` when linker layout or section permissions change.
-5. Run `workshop run -- run-kernel` and verify the serial output.
+5. Run `workshop run -- run-kernel` for any additional interactive inspection.
 6. Record the commands and observed behavior in the pull request.
 
 ## Using an Interactive Shell

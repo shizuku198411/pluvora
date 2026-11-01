@@ -1,6 +1,8 @@
-use core::arch::asm;
 use core::mem::size_of;
 use core::ptr;
+
+#[cfg(target_arch = "riscv64")]
+use core::arch::asm;
 
 use crate::memory::{EarlyFrameAllocator, Error as MemoryError, PAGE_SIZE};
 use crate::platform::MemoryRegion;
@@ -17,7 +19,9 @@ const PTE_EXECUTE: u64 = 1 << 3;
 const PTE_ACCESSED: u64 = 1 << 6;
 const PTE_DIRTY: u64 = 1 << 7;
 
+#[cfg(target_arch = "riscv64")]
 const SATP_MODE_SV39: u64 = 8;
+#[cfg(target_arch = "riscv64")]
 const SATP_MODE_SHIFT: u64 = 60;
 const SATP_PPN_MASK: u64 = (1 << 44) - 1;
 
@@ -123,13 +127,14 @@ pub fn build(
   })
 }
 
-// Activates an identity-mapped Sv39 address space.
-//
-// # SAFETY
-//
-// The caller must ensure that the current instruction address, stack, all subsequently
-// accessed static data, and the SBI console call path are valid in `paging`
-// before this function writes `satp`.
+/// Activates an identity-mapped Sv39 address space.
+///
+/// # Safety
+///
+/// The caller must ensure that the current instruction address, stack, all subsequently
+/// accessed static data, and the SBI console call path are valid in `paging`
+/// before this function writes `satp`.
+#[cfg(target_arch = "riscv64")]
 pub unsafe fn activate(paging: PagingInfo) -> Result<(), Error> {
   let root_ppn = paging.root_frame >> PAGE_SHIFT;
   if root_ppn > SATP_PPN_MASK {
@@ -312,4 +317,71 @@ fn align_up(value: u64) -> Result<u64, Error> {
     .checked_add(PAGE_SIZE - 1)
     .map(align_down)
     .ok_or(Error::InvalidRegion)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn vm_001_lower_sv39_address_is_canonical() {
+    assert!(is_sv39_canonical(0x0000_003f_ffff_ffff));
+  }
+
+  #[test]
+  fn vm_002_upper_sv39_address_is_canonical() {
+    assert!(is_sv39_canonical(0xffff_ffc0_0000_0000));
+  }
+
+  #[test]
+  fn vm_003_invalid_sign_extension_is_rejected() {
+    assert!(!is_sv39_canonical(0x0000_0040_0000_0000));
+    assert!(!is_sv39_canonical(0xffff_ffbf_ffff_ffff));
+  }
+
+  #[test]
+  fn vm_004_vpn_indices_are_extracted_from_the_expected_bits() {
+    let address = (0x12au64 << 30) | (0x155u64 << 21) | (0x0aau64 << 12);
+    assert_eq!(vpn_indices(address), [0x0aa, 0x155, 0x12a]);
+  }
+
+  #[test]
+  fn vm_005_pte_ppn_round_trips() {
+    let physical_address = 0x0000_1234_5678_9000;
+    let entry = table_pointer(physical_address);
+    assert_eq!(pte_physical_address(entry), physical_address);
+    assert_eq!(entry & PTE_VALID, PTE_VALID);
+  }
+
+  #[test]
+  fn vm_007_non_leaf_pointer_only_sets_valid_flag() {
+    let entry = table_pointer(0x8020_0000);
+    assert_eq!(entry & 0xff, PTE_VALID);
+    assert!(!is_leaf(entry));
+  }
+
+  #[test]
+  fn vm_009_permission_sets_never_create_write_execute_leaves() {
+    for permissions in [
+      Permissions::ReadOnly,
+      Permissions::ReadWrite,
+      Permissions::ReadExecute,
+    ] {
+      let flags = permissions.pte_flags();
+      assert_ne!(flags & PTE_READ, 0);
+      assert_ne!(flags & (PTE_WRITE | PTE_EXECUTE), PTE_WRITE | PTE_EXECUTE);
+    }
+  }
+
+  #[test]
+  fn vm_015_alignment_covers_partial_pages() {
+    assert_eq!(align_down(0x1234), 0x1000);
+    assert_eq!(align_up(0x1234), Ok(0x2000));
+    assert_eq!(align_up(0x2000), Ok(0x2000));
+  }
+
+  #[test]
+  fn vm_015_alignment_overflow_is_rejected() {
+    assert_eq!(align_up(u64::MAX), Err(Error::InvalidRegion));
+  }
 }

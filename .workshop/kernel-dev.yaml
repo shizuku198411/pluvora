@@ -36,3 +36,19 @@ actions:
       -nographic \
       -bios opensbi/build/platform/generic/firmware/fw_jump.bin \
       -kernel kernel/target/riscv64imac-unknown-none-elf/release/Pluvora-kernel
+
+  # run every currently implemented Rust and QEMU test
+  test-all: |
+    bash scripts/test.sh all
+
+  # run host-side Rust logic tests; optionally pass a name filter
+  test-rust: |
+    bash scripts/test.sh rust "$@"
+
+  # run Python-driven QEMU tests; optionally pass a name filter
+  test-qemu: |
+    bash scripts/test.sh qemu "$@"
+
+  # run one category and optional filter: test-one rust|qemu [filter]
+  test-one: |
+    bash scripts/test.sh "$@"

@@ -1,0 +1,30 @@
+name: Test
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Workshop test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Launch kernel development workshop
+        uses: canonical/launch-workshop@b538173e2c4163488c4628b4aef79a6002475e76 # v1
+        with:
+          workshop: kernel-dev
+
+      - name: Run all tests
+        run: workshop run -- test-all

@@ -95,12 +95,13 @@ pub struct Dtb<'a> {
 }
 
 impl<'a> Dtb<'a> {
-  // Creates a bounded DTB view from the physical address supplied by OpenSBI.
-  //
-  // # Safety
-  // `address` must point to readable physical memory containing at least
-  // an FDT header. That memory must remain readable and immutable for `'a`.
-  // Before paging is enabled, Pluvora directly addresses this physical memory.
+  /// Creates a bounded DTB view from the physical address supplied by OpenSBI.
+  ///
+  /// # Safety
+  ///
+  /// `address` must point to readable physical memory containing at least
+  /// an FDT header. That memory must remain readable and immutable for `'a`.
+  /// Before paging is enabled, Pluvora directly addresses this physical memory.
   pub unsafe fn from_ptr(address: usize) -> Result<Self, Error> {
     if address == 0 {
       return Err(Error::NullAddress);
@@ -457,4 +458,166 @@ fn align_up_4(value: usize) -> Result<usize, Error> {
     .checked_add(3)
     .map(|value| value & !3)
     .ok_or(Error::InvalidRange)
+}
+
+#[cfg(test)]
+mod tests {
+  use std::vec::Vec;
+
+  use super::*;
+
+  const HEADER_SIZE: usize = 40;
+
+  fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+  }
+
+  fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+  }
+
+  fn minimal_dtb(reservations: &[(u64, u64)]) -> Vec<u8> {
+    let mut reservation_block = Vec::new();
+    for (address, size) in reservations {
+      push_u64(&mut reservation_block, *address);
+      push_u64(&mut reservation_block, *size);
+    }
+    push_u64(&mut reservation_block, 0);
+    push_u64(&mut reservation_block, 0);
+
+    let mut structure = Vec::new();
+    push_u32(&mut structure, FDT_BEGIN_NODE);
+    structure.extend_from_slice(&[0, 0, 0, 0]);
+    push_u32(&mut structure, FDT_END_NODE);
+    push_u32(&mut structure, FDT_END);
+
+    let reservation_offset = HEADER_SIZE;
+    let structure_offset = reservation_offset + reservation_block.len();
+    let strings_offset = structure_offset + structure.len();
+    let total_size = strings_offset;
+
+    let mut blob = Vec::with_capacity(total_size);
+    push_u32(&mut blob, FDT_MAGIC);
+    push_u32(&mut blob, total_size as u32);
+    push_u32(&mut blob, structure_offset as u32);
+    push_u32(&mut blob, strings_offset as u32);
+    push_u32(&mut blob, reservation_offset as u32);
+    push_u32(&mut blob, FDT_SUPPORTED_VERSION);
+    push_u32(&mut blob, 16);
+    push_u32(&mut blob, 0);
+    push_u32(&mut blob, 0);
+    push_u32(&mut blob, structure.len() as u32);
+    blob.extend_from_slice(&reservation_block);
+    blob.extend_from_slice(&structure);
+    blob
+  }
+
+  #[test]
+  fn dtb_001_valid_minimal_blob_is_accepted() {
+    let blob = minimal_dtb(&[]);
+    let dtb = Dtb::from_bytes(&blob).unwrap();
+    assert_eq!(dtb.header().total_size, blob.len());
+    assert_eq!(dtb.header().version, FDT_SUPPORTED_VERSION);
+
+    let events = dtb.events().collect::<Result<Vec<_>, _>>().unwrap();
+    assert!(matches!(
+      events.as_slice(),
+      [
+        Event::BeginNode { depth: 0, name: "" },
+        Event::EndNode { depth: 0 },
+        Event::End
+      ]
+    ));
+  }
+
+  #[test]
+  fn dtb_002_bad_magic_is_rejected() {
+    let mut blob = minimal_dtb(&[]);
+    blob[0] = 0;
+    assert!(matches!(Dtb::from_bytes(&blob), Err(Error::BadMagic)));
+  }
+
+  #[test]
+  fn dtb_003_unsupported_version_is_rejected() {
+    let mut blob = minimal_dtb(&[]);
+    blob[20..24].copy_from_slice(&16u32.to_be_bytes());
+    assert!(matches!(
+      Dtb::from_bytes(&blob),
+      Err(Error::UnsupportedVersion)
+    ));
+  }
+
+  #[test]
+  fn dtb_004_short_blob_is_rejected() {
+    assert!(matches!(
+      Dtb::from_bytes(&[0; FDT_HEADER_SIZE - 1]),
+      Err(Error::BlobTooSmall)
+    ));
+  }
+
+  #[test]
+  fn dtb_005_total_size_must_match_the_bounded_blob() {
+    let mut blob = minimal_dtb(&[]);
+    let incorrect = (blob.len() as u32 + 1).to_be_bytes();
+    blob[4..8].copy_from_slice(&incorrect);
+    assert!(matches!(Dtb::from_bytes(&blob), Err(Error::InvalidRange)));
+  }
+
+  #[test]
+  fn dtb_009_unaligned_structure_offset_is_rejected() {
+    let mut blob = minimal_dtb(&[]);
+    blob[8..12].copy_from_slice(&57u32.to_be_bytes());
+    assert!(matches!(
+      Dtb::from_bytes(&blob),
+      Err(Error::InvalidAlignment)
+    ));
+  }
+
+  #[test]
+  fn dtb_013_unknown_structure_token_is_rejected() {
+    let mut blob = minimal_dtb(&[]);
+    let structure_offset = read_be_u32(&blob, 8).unwrap() as usize;
+    blob[structure_offset..structure_offset + 4].copy_from_slice(&0xffu32.to_be_bytes());
+    let dtb = Dtb::from_bytes(&blob).unwrap();
+    assert!(matches!(
+      dtb.events().next(),
+      Some(Err(Error::UnknownToken))
+    ));
+  }
+
+  #[test]
+  fn dtb_018_missing_reservation_terminator_is_rejected() {
+    let mut blob = minimal_dtb(&[(0x8000_0000, 0x1000)]);
+    blob[56..64].copy_from_slice(&1u64.to_be_bytes());
+    blob[64..72].copy_from_slice(&1u64.to_be_bytes());
+    assert!(matches!(
+      Dtb::from_bytes(&blob),
+      Err(Error::MissingReservationTerminator) | Err(Error::InvalidRange)
+    ));
+  }
+
+  #[test]
+  fn dtb_019_reservation_terminator_is_not_returned_as_data() {
+    let blob = minimal_dtb(&[(0x8000_0000, 0x2000)]);
+    let dtb = Dtb::from_bytes(&blob).unwrap();
+    let reservations = dtb.reservations().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(
+      reservations,
+      [MemoryReservation {
+        address: 0x8000_0000,
+        size: 0x2000,
+      }]
+    );
+  }
+
+  #[test]
+  fn dtb_020_iterator_stops_after_an_error() {
+    let mut blob = minimal_dtb(&[]);
+    let structure_offset = read_be_u32(&blob, 8).unwrap() as usize;
+    blob[structure_offset..structure_offset + 4].copy_from_slice(&0xffu32.to_be_bytes());
+    let dtb = Dtb::from_bytes(&blob).unwrap();
+    let mut events = dtb.events();
+    assert!(events.next().unwrap().is_err());
+    assert!(events.next().is_none());
+  }
 }

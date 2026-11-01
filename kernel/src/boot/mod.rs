@@ -2,7 +2,10 @@ mod report;
 
 use core::ptr::addr_of;
 
-use crate::arch::riscv64::paging::{self, KernelLayout};
+use crate::arch::riscv64::{
+  paging::{self, KernelLayout},
+  trap,
+};
 use crate::dtb::Dtb;
 use crate::memory::EarlyFrameAllocator;
 use crate::platform::{MemoryRegion, PlatformInfo, discover};
@@ -49,6 +52,9 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
   // rodata, data, BSS/stack, and the DTB before satp is changed.
   unsafe { paging::activate(paging) }.unwrap_or_else(|error| fail("Paging", error.as_str()));
   report::paging_active();
+
+  let stvec = trap::install();
+  report::trap_ready(stvec);
 
   report::complete();
   cpu::park()

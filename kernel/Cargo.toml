@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[lib]
+name = "pluvora_kernel"
+path = "src/lib.rs"
+
 [profile.dev]
 panic = "abort"
 

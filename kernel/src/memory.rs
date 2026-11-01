@@ -139,3 +139,111 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, Error> {
     .map(|value| value & !(alignment - 1))
     .ok_or(Error::InvalidRange)
 }
+
+#[cfg(test)]
+mod tests {
+  use core::ptr;
+  use std::alloc::{Layout, alloc, dealloc};
+
+  use super::*;
+
+  struct TestMemory {
+    pointer: *mut u8,
+    layout: Layout,
+  }
+
+  impl TestMemory {
+    fn new(pages: usize) -> Self {
+      let layout = Layout::from_size_align(pages * PAGE_SIZE as usize, PAGE_SIZE as usize).unwrap();
+      // SAFETY: layout has non-zero size and a supported power-of-two alignment.
+      let pointer = unsafe { alloc(layout) };
+      assert!(!pointer.is_null());
+      // SAFETY: allocation covers the complete layout.
+      unsafe { ptr::write_bytes(pointer, 0xa5, layout.size()) };
+      Self { pointer, layout }
+    }
+
+    fn region(&self) -> MemoryRegion {
+      MemoryRegion {
+        base: self.pointer as u64,
+        size: self.layout.size() as u64,
+      }
+    }
+  }
+
+  impl Drop for TestMemory {
+    fn drop(&mut self) {
+      // SAFETY: pointer was allocated with this exact layout and is dropped once.
+      unsafe { dealloc(self.pointer, self.layout) };
+    }
+  }
+
+  #[test]
+  fn mem_002_region_end_overflow_is_detected() {
+    assert_eq!(
+      MemoryRegion {
+        base: u64::MAX,
+        size: 1,
+      }
+      .end(),
+      None
+    );
+  }
+
+  #[test]
+  fn mem_003_ranges_use_half_open_overlap_semantics() {
+    let left = MemoryRegion {
+      base: 0x1000,
+      size: 0x1000,
+    };
+    let overlapping = MemoryRegion {
+      base: 0x1800,
+      size: 0x1000,
+    };
+    let adjacent = MemoryRegion {
+      base: 0x2000,
+      size: 0x1000,
+    };
+    assert_eq!(overlaps(left, overlapping), Ok(true));
+    assert_eq!(overlaps(left, adjacent), Ok(false));
+  }
+
+  #[test]
+  fn mem_006_align_up_overflow_is_rejected() {
+    assert_eq!(align_up(u64::MAX, PAGE_SIZE), Err(Error::InvalidRange));
+  }
+
+  #[test]
+  fn mem_010_allocator_returns_aligned_zeroed_frames_and_skips_reservations() {
+    let storage = TestMemory::new(3);
+    let memory = storage.region();
+    let reserved = MemoryRegion {
+      base: memory.base + PAGE_SIZE,
+      size: PAGE_SIZE,
+    };
+    let platform = PlatformInfo::for_test(&[memory], &[reserved]);
+    let kernel = MemoryRegion {
+      base: 0x1000,
+      size: 1,
+    };
+    let dtb = MemoryRegion {
+      base: 0x2000,
+      size: 1,
+    };
+    let mut allocator = EarlyFrameAllocator::new(&platform, kernel, dtb).unwrap();
+
+    let first = allocator.allocate_zeroed().unwrap().unwrap();
+    let second = allocator.allocate_zeroed().unwrap().unwrap();
+    assert_eq!(first.start(), memory.base);
+    assert_eq!(second.start(), memory.base + 2 * PAGE_SIZE);
+    assert!(first.start().is_multiple_of(PAGE_SIZE));
+
+    // SAFETY: both frames remain inside the live test allocation.
+    let first_bytes = unsafe { core::slice::from_raw_parts(first.start() as *const u8, 4096) };
+    // SAFETY: both frames remain inside the live test allocation.
+    let second_bytes = unsafe { core::slice::from_raw_parts(second.start() as *const u8, 4096) };
+    assert!(first_bytes.iter().all(|byte| *byte == 0));
+    assert!(second_bytes.iter().all(|byte| *byte == 0));
+    assert_eq!(allocator.allocate_zeroed(), Ok(None));
+  }
+}
