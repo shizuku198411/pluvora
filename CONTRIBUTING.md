@@ -40,6 +40,8 @@ workshop run -- run-kernel
 
 Run `workshop run -- check-elf` as well when a change affects the linker script, memory layout, or ELF section permissions. The full setup and test procedure is documented in [Developing and Testing Pluvora](docs/development/getting-started.md).
 
+Pull requests run `workshop run -- test-all` through GitHub Actions. Run the same action locally before submission so that formatting, Clippy, Rust logic tests, and QEMU integration tests match CI.
+
 Commit messages should be concise and use the imperative mood when practical, for example:
 
 ```text

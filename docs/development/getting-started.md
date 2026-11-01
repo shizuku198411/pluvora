@@ -110,6 +110,18 @@ workshop run -- test-one qemu boot_005
 
 A filter that matches no QEMU test is an error. A QEMU timeout, early emulator exit, kernel panic, boot failure, or fatal trap also fails the relevant test rather than being treated as a successful shutdown.
 
+## Continuous Integration
+
+GitHub Actions runs the same `test-all` Workshop action for every pull request. The workflow is defined in `.github/workflows/test.yml` and uses Canonical's `launch-workshop` action to create an ephemeral `kernel-dev` environment on a GitHub-hosted Ubuntu runner.
+
+The CI job intentionally delegates its checks to the repository's Workshop action:
+
+```sh
+workshop run -- test-all
+```
+
+This keeps formatting, Clippy, Rust logic tests, the release build, and Python-driven QEMU tests consistent between local development and CI. The external GitHub Actions used by the workflow are pinned to commit SHAs; version comments record the corresponding release tags.
+
 ## Build and Check the Kernel
 
 Run the complete build check:
