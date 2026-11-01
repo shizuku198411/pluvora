@@ -2,7 +2,10 @@
 use core::arch::asm;
 
 #[cfg(target_arch = "riscv64")]
-use crate::support::{console, cpu};
+use crate::{
+  arch::riscv64::ipi,
+  support::{console, cpu},
+};
 
 const INTERRUPT_BIT: usize = 1 << (usize::BITS - 1);
 const CAUSE_CODE_MASK: usize = !INTERRUPT_BIT;
@@ -159,6 +162,11 @@ pub fn install() -> usize {
 #[unsafe(no_mangle)]
 extern "C" fn trap_handler(frame: &mut TrapFrame) {
   let cause = Cause::from_scause(frame.scause);
+
+  if cause == Cause::Interrupt(Interrupt::SupervisorSoftware) {
+    ipi::handle_local();
+    return;
+  }
 
   if cause == Cause::Exception(Exception::Breakpoint) {
     frame.sepc = frame

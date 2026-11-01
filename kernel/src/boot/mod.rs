@@ -3,7 +3,7 @@ mod report;
 use core::ptr::addr_of;
 
 use crate::arch::riscv64::{
-  hart,
+  hart, ipi,
   paging::{self, KernelLayout},
   trap,
 };
@@ -55,6 +55,7 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
   report::paging_active();
 
   let stvec = trap::install();
+  ipi::enable_local();
   report::trap_ready(stvec);
 
   let boot_index = hart::initialize_boot_hart(&platform, hart_id)
@@ -72,6 +73,7 @@ pub fn run_secondary(hart_id: usize, hart_index: usize) -> ! {
   // installed the shared Sv39 satp, executed SFENCE.VMA,
   // and set tp to HartLocal.
   let _stvec = trap::install();
+  ipi::enable_local();
   hart::complete_secondary(hart_id, hart_index).unwrap_or_else(|_| cpu::park());
   cpu::park()
 }

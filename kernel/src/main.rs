@@ -1,17 +1,13 @@
 #![no_main]
 #![no_std]
 
-mod arch;
-mod boot;
-mod dtb;
-mod memory;
-mod platform;
-mod support;
-
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
-use support::{console, cpu};
+use pluvora_kernel::{
+  boot,
+  support::{console, cpu},
+};
 
 global_asm!(include_str!("entry.S"));
 global_asm!(include_str!("arch/riscv64/secondary.S"));

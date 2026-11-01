@@ -3,7 +3,7 @@ use core::arch::asm;
 #[cfg(target_arch = "riscv64")]
 use core::hint::spin_loop;
 use core::mem::{offset_of, size_of};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(target_arch = "riscv64")]
 use crate::arch::riscv64::paging::PagingInfo;
@@ -22,6 +22,12 @@ const HART_ONLINE: usize = 2;
 const BOOT_INFO_EMPTY: usize = 0;
 #[cfg(target_arch = "riscv64")]
 const BOOT_INFO_STARTING: usize = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DepthError {
+  Overflow,
+  Underflow,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -60,7 +66,11 @@ pub struct HartLocal {
   dense_index: AtomicUsize,
   state: AtomicUsize,
   current_thread: AtomicUsize,
-  interrupt_state: AtomicUsize,
+  interrupt_disable_depth: AtomicUsize,
+  restore_interrupts: AtomicBool,
+  preemption_disable_depth: AtomicUsize,
+  pending_ipi_requests: AtomicUsize,
+  reschedule_pending: AtomicBool,
   shootdown_queue: AtomicUsize,
 }
 
@@ -71,10 +81,154 @@ impl HartLocal {
       dense_index: AtomicUsize::new(usize::MAX),
       state: AtomicUsize::new(HART_OFFLINE),
       current_thread: AtomicUsize::new(0),
-      interrupt_state: AtomicUsize::new(0),
+      interrupt_disable_depth: AtomicUsize::new(0),
+      restore_interrupts: AtomicBool::new(false),
+      preemption_disable_depth: AtomicUsize::new(0),
+      pending_ipi_requests: AtomicUsize::new(0),
+      reschedule_pending: AtomicBool::new(false),
       shootdown_queue: AtomicUsize::new(0),
     }
   }
+
+  pub fn raw_hart_id(&self) -> usize {
+    self.raw_hart_id.load(Ordering::Relaxed)
+  }
+
+  pub fn is_online(&self) -> bool {
+    self.state.load(Ordering::Acquire) == HART_ONLINE
+  }
+
+  pub fn publish_ipi_request(&self, bits: usize) {
+    self.pending_ipi_requests.fetch_or(bits, Ordering::Release);
+  }
+
+  pub fn take_ipi_requests(&self) -> usize {
+    self.pending_ipi_requests.swap(0, Ordering::Acquire)
+  }
+
+  pub fn request_reschedule(&self) {
+    self.reschedule_pending.store(true, Ordering::Release);
+  }
+
+  pub fn take_reschedule_request(&self) -> bool {
+    self.reschedule_pending.swap(false, Ordering::AcqRel)
+  }
+
+  fn enter_interrupt_disabled(&self, interrupts_were_enabled: bool) -> Result<(), DepthError> {
+    let previous = increment_depth(&self.interrupt_disable_depth)?;
+    if previous == 0 {
+      self
+        .restore_interrupts
+        .store(interrupts_were_enabled, Ordering::Relaxed);
+    }
+    Ok(())
+  }
+
+  fn leave_interrupt_disabled(&self) -> Result<bool, DepthError> {
+    let previous = decrement_depth(&self.interrupt_disable_depth)?;
+    Ok(previous == 1 && self.restore_interrupts.swap(false, Ordering::Relaxed))
+  }
+
+  fn enter_preemption_disabled(&self) -> Result<(), DepthError> {
+    increment_depth(&self.preemption_disable_depth).map(|_| ())
+  }
+
+  fn leave_preemption_disabled(&self) -> Result<(), DepthError> {
+    decrement_depth(&self.preemption_disable_depth).map(|_| ())
+  }
+}
+
+fn increment_depth(depth: &AtomicUsize) -> Result<usize, DepthError> {
+  depth
+    .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+      current.checked_add(1)
+    })
+    .map_err(|_| DepthError::Overflow)
+}
+
+fn decrement_depth(depth: &AtomicUsize) -> Result<usize, DepthError> {
+  depth
+    .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+      current.checked_sub(1)
+    })
+    .map_err(|_| DepthError::Underflow)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub struct InterruptGuard {
+  local: &'static HartLocal,
+}
+
+#[cfg(target_arch = "riscv64")]
+impl InterruptGuard {
+  pub fn disable() -> Self {
+    let interrupts_were_enabled = disable_local_interrupts();
+    let local = current();
+    local
+      .enter_interrupt_disabled(interrupts_were_enabled)
+      .expect("interrupt disable depth overflow");
+    Self { local }
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+impl Drop for InterruptGuard {
+  fn drop(&mut self) {
+    let restore = self
+      .local
+      .leave_interrupt_disabled()
+      .expect("interrupt disable depth underflow");
+    if restore {
+      enable_local_interrupts();
+    }
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub struct PreemptionGuard {
+  local: &'static HartLocal,
+}
+
+#[cfg(target_arch = "riscv64")]
+impl PreemptionGuard {
+  pub fn disable() -> Self {
+    let local = current();
+    local
+      .enter_preemption_disabled()
+      .expect("preemption disable depth overflow");
+    Self { local }
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+impl Drop for PreemptionGuard {
+  fn drop(&mut self) {
+    self
+      .local
+      .leave_preemption_disabled()
+      .expect("preemption disable depth underflow");
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn disable_local_interrupts() -> bool {
+  const SSTATUS_SIE: usize = 1 << 1;
+  let previous: usize;
+  unsafe {
+    asm!(
+      "csrrc {previous}, sstatus, {mask}",
+      previous = out(reg) previous,
+      mask = in(reg) SSTATUS_SIE,
+      options(nomem, nostack),
+    )
+  };
+  previous & SSTATUS_SIE != 0
+}
+
+#[cfg(target_arch = "riscv64")]
+fn enable_local_interrupts() {
+  const SSTATUS_SIE: usize = 1 << 1;
+  unsafe { asm!("csrs sstatus, {mask}", mask = in(reg) SSTATUS_SIE, options(nomem, nostack)) };
 }
 
 #[repr(C)]
@@ -284,6 +438,19 @@ fn install_hart_local_pointer(local: &HartLocal) {
   unsafe { asm!("mv tp, {pointer}", pointer = in(reg) pointer, options(nostack)) };
 }
 
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn current() -> &'static HartLocal {
+  let pointer: usize;
+  unsafe { asm!("mv {pointer}, tp", pointer = out(reg) pointer, options(nomem, nostack)) };
+  assert!(pointer != 0, "hart-local pointer is not installed");
+  // SAFETY: tp is installed from the static HARTS array and remains valid.
+  unsafe { &*(pointer as *const HartLocal) }
+}
+
+pub fn local_by_index(index: usize) -> Option<&'static HartLocal> {
+  HARTS.get(index)
+}
+
 const _: () = {
   assert!(size_of::<SecondaryBootInfo>() == 48);
   assert!(offset_of!(SecondaryBootInfo, stack_top) == 0);
@@ -318,7 +485,8 @@ mod tests {
   fn hart_007_each_hart_has_distinct_local_storage() {
     let harts = [const { HartLocal::empty() }; 2];
     assert_ne!(&harts[0] as *const HartLocal, &harts[1] as *const HartLocal);
-    assert_eq!(size_of::<HartLocal>(), 64);
+    assert_eq!(align_of::<HartLocal>(), 64);
+    assert_eq!(size_of::<HartLocal>() % 64, 0);
   }
 
   #[test]
@@ -365,5 +533,84 @@ mod tests {
       Err(Error::HartIdMismatch)
     );
     assert_eq!(mismatched.state.load(Ordering::Relaxed), HART_STARTING);
+  }
+
+  #[test]
+  fn sync_006_interrupt_nesting_preserves_outer_restore_state() {
+    let local = HartLocal::empty();
+    assert_eq!(local.enter_interrupt_disabled(true), Ok(()));
+    assert_eq!(local.enter_interrupt_disabled(false), Ok(()));
+    assert_eq!(local.interrupt_disable_depth.load(Ordering::Relaxed), 2);
+
+    assert_eq!(local.leave_interrupt_disabled(), Ok(false));
+    assert_eq!(local.leave_interrupt_disabled(), Ok(true));
+    assert_eq!(local.interrupt_disable_depth.load(Ordering::Relaxed), 0);
+  }
+
+  #[test]
+  fn sync_007_disabled_outer_state_is_not_restored() {
+    let local = HartLocal::empty();
+    assert_eq!(local.enter_interrupt_disabled(false), Ok(()));
+    assert_eq!(local.enter_interrupt_disabled(true), Ok(()));
+    assert_eq!(local.leave_interrupt_disabled(), Ok(false));
+    assert_eq!(local.leave_interrupt_disabled(), Ok(false));
+  }
+
+  #[test]
+  fn sync_008_preemption_depth_is_independent_from_interrupt_depth() {
+    let local = HartLocal::empty();
+    assert_eq!(local.enter_interrupt_disabled(true), Ok(()));
+    assert_eq!(local.enter_preemption_disabled(), Ok(()));
+    assert_eq!(local.enter_preemption_disabled(), Ok(()));
+    assert_eq!(local.interrupt_disable_depth.load(Ordering::Relaxed), 1);
+    assert_eq!(local.preemption_disable_depth.load(Ordering::Relaxed), 2);
+
+    assert_eq!(local.leave_preemption_disabled(), Ok(()));
+    assert_eq!(local.leave_preemption_disabled(), Ok(()));
+    assert_eq!(local.leave_interrupt_disabled(), Ok(true));
+  }
+
+  #[test]
+  fn sync_009_depth_errors_do_not_wrap_the_counter() {
+    let depth = AtomicUsize::new(usize::MAX);
+    assert_eq!(increment_depth(&depth), Err(DepthError::Overflow));
+    assert_eq!(depth.load(Ordering::Relaxed), usize::MAX);
+
+    let depth = AtomicUsize::new(0);
+    assert_eq!(decrement_depth(&depth), Err(DepthError::Underflow));
+    assert_eq!(depth.load(Ordering::Relaxed), 0);
+  }
+
+  #[test]
+  fn ipi_001_request_mailbox_round_trips_and_clears() {
+    let local = HartLocal::empty();
+    local.publish_ipi_request(0b1010);
+    assert_eq!(local.take_ipi_requests(), 0b1010);
+    assert_eq!(local.take_ipi_requests(), 0);
+  }
+
+  #[test]
+  fn ipi_002_request_mailbox_coalesces_duplicate_bits() {
+    let local = HartLocal::empty();
+    local.publish_ipi_request(1);
+    local.publish_ipi_request(1);
+    assert_eq!(local.take_ipi_requests(), 1);
+  }
+
+  #[test]
+  fn ipi_003_request_mailbox_preserves_distinct_bits() {
+    let local = HartLocal::empty();
+    local.publish_ipi_request(1 << 0);
+    local.publish_ipi_request(1 << 3);
+    assert_eq!(local.take_ipi_requests(), (1 << 0) | (1 << 3));
+  }
+
+  #[test]
+  fn ipi_007_reschedule_flag_is_consumed_once() {
+    let local = HartLocal::empty();
+    assert!(!local.take_reschedule_request());
+    local.request_reschedule();
+    assert!(local.take_reschedule_request());
+    assert!(!local.take_reschedule_request());
   }
 }

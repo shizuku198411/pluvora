@@ -9,6 +9,11 @@ const HSM_HART_START: usize = 0;
 #[cfg(target_arch = "riscv64")]
 const SBI_SUCCESS: isize = 0;
 
+#[cfg(target_arch = "riscv64")]
+const EXTENSION_IPI: usize = 0x0073_5049;
+#[cfg(target_arch = "riscv64")]
+const IPI_SEND_IPI: usize = 0;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Error {
   code: isize,
@@ -31,7 +36,7 @@ impl Error {
 #[cfg(target_arch = "riscv64")]
 pub fn hart_start(hart_id: usize, start_address: usize, opaque: usize) -> Result<(), Error> {
   let (error, _value) = unsafe {
-    call3(
+    call(
       EXTENSION_HSM,
       HSM_HART_START,
       hart_id,
@@ -47,6 +52,21 @@ pub fn hart_start(hart_id: usize, start_address: usize, opaque: usize) -> Result
   }
 }
 
+#[cfg(target_arch = "riscv64")]
+pub fn send_ipi(raw_hart_id: usize) -> Result<(), Error> {
+  let (hart_mask, hart_mask_base) = single_hart_mask(raw_hart_id);
+  let (error, _value) = unsafe { call(EXTENSION_IPI, IPI_SEND_IPI, hart_mask, hart_mask_base, 0) };
+  if error == SBI_SUCCESS {
+    Ok(())
+  } else {
+    Err(Error { code: error })
+  }
+}
+
+fn single_hart_mask(raw_hart_id: usize) -> (usize, usize) {
+  (1, raw_hart_id)
+}
+
 // Performs an SBI call with three arguments.
 //
 // # SAFETY
@@ -54,7 +74,7 @@ pub fn hart_start(hart_id: usize, start_address: usize, opaque: usize) -> Result
 // The caller must use an extension/function pair whose argument contract
 // matches `argument0..=argument2` and must accept any SBI-visible side effects.
 #[cfg(target_arch = "riscv64")]
-unsafe fn call3(
+unsafe fn call(
   extension: usize,
   function: usize,
   argument0: usize,
@@ -104,5 +124,12 @@ mod tests {
     let error = Error { code: -99 };
     assert_eq!(error.code, -99);
     assert_eq!(error.as_str(), "unknown SBI error");
+  }
+
+  #[test]
+  fn ipi_005_single_hart_mask_supports_sparse_raw_ids() {
+    assert_eq!(single_hart_mask(0), (1, 0));
+    assert_eq!(single_hart_mask(9), (1, 9));
+    assert_eq!(single_hart_mask(usize::MAX - 1), (1, usize::MAX - 1));
   }
 }
