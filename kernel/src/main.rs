@@ -14,6 +14,7 @@ use core::panic::PanicInfo;
 use support::{console, cpu};
 
 global_asm!(include_str!("entry.S"));
+global_asm!(include_str!("arch/riscv64/trap.S"));
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_entry(hart_id: usize, dtb_address: usize) -> ! {
