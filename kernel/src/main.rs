@@ -27,5 +27,5 @@ extern "C" fn secondary_kernel_entry(hart_id: usize, hart_index: usize) -> ! {
 fn panic(_info: &PanicInfo<'_>) -> ! {
   console::newline();
   console::write_line("[PANIC] unrecoverable kernel error during bootstrap");
-  cpu::park()
+  cpu::halt()
 }

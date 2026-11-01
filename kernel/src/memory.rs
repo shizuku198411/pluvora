@@ -247,3 +247,5 @@ mod tests {
     assert_eq!(allocator.allocate_zeroed(), Ok(None));
   }
 }
+
+pub mod address_space;

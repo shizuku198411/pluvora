@@ -3,11 +3,12 @@ use core::arch::asm;
 #[cfg(target_arch = "riscv64")]
 use core::hint::spin_loop;
 use core::mem::{offset_of, size_of};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(target_arch = "riscv64")]
 use crate::arch::riscv64::paging::PagingInfo;
 use crate::arch::riscv64::sbi;
+use crate::memory::address_space::Asid;
 use crate::platform::{MAX_HARTS, PlatformInfo};
 
 #[cfg(target_arch = "riscv64")]
@@ -71,7 +72,8 @@ pub struct HartLocal {
   preemption_disable_depth: AtomicUsize,
   pending_ipi_requests: AtomicUsize,
   reschedule_pending: AtomicBool,
-  shootdown_queue: AtomicUsize,
+  current_asid: AtomicUsize,
+  current_asid_generation: AtomicU64,
 }
 
 impl HartLocal {
@@ -86,7 +88,8 @@ impl HartLocal {
       preemption_disable_depth: AtomicUsize::new(0),
       pending_ipi_requests: AtomicUsize::new(0),
       reschedule_pending: AtomicBool::new(false),
-      shootdown_queue: AtomicUsize::new(0),
+      current_asid: AtomicUsize::new(0),
+      current_asid_generation: AtomicU64::new(0),
     }
   }
 
@@ -135,6 +138,23 @@ impl HartLocal {
 
   fn leave_preemption_disabled(&self) -> Result<(), DepthError> {
     decrement_depth(&self.preemption_disable_depth).map(|_| ())
+  }
+
+  pub fn dense_index(&self) -> usize {
+    self.dense_index.load(Ordering::Relaxed)
+  }
+
+  pub fn install_address_space(&self, asid: Asid) {
+    self
+      .current_asid_generation
+      .store(asid.generation(), Ordering::Relaxed);
+    self
+      .current_asid
+      .store(usize::from(asid.value()), Ordering::Release);
+  }
+
+  pub fn has_ipi_requests(&self) -> bool {
+    self.pending_ipi_requests.load(Ordering::Acquire) != 0
   }
 }
 
@@ -445,6 +465,26 @@ pub(crate) fn current() -> &'static HartLocal {
   assert!(pointer != 0, "hart-local pointer is not installed");
   // SAFETY: tp is installed from the static HARTS array and remains valid.
   unsafe { &*(pointer as *const HartLocal) }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn current_index() -> usize {
+  current().dense_index()
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn install_kernel_address_space() {
+  current().install_address_space(Asid::kernel());
+}
+
+pub fn online_mask() -> u64 {
+  HARTS.iter().enumerate().fold(0, |mask, (index, local)| {
+    if local.is_online() {
+      mask | (1u64 << index)
+    } else {
+      mask
+    }
+  })
 }
 
 pub fn local_by_index(index: usize) -> Option<&'static HartLocal> {

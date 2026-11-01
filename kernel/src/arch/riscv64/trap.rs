@@ -190,7 +190,7 @@ fn fatal_trap(frame: &TrapFrame, cause: Cause) -> ! {
   field("stval", frame.stval());
   field("sstatus", frame.sstatus());
   field("Saved sp", frame.stack_pointer());
-  cpu::park()
+  cpu::halt()
 }
 
 #[cfg(target_arch = "riscv64")]

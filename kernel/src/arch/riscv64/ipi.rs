@@ -2,17 +2,22 @@
 use core::arch::asm;
 
 use crate::arch::riscv64::{hart, sbi};
+#[cfg(target_arch = "riscv64")]
+use crate::{arch::riscv64::tlb, support::cpu};
 const REQUEST_RESCHEDULE: usize = 1 << 0;
+const REQUEST_TLB_SHOOTDOWN: usize = 1 << 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Request {
   Reschedule,
+  TlbShootdown,
 }
 
 impl Request {
   const fn bit(self) -> usize {
     match self {
       Self::Reschedule => REQUEST_RESCHEDULE,
+      Self::TlbShootdown => REQUEST_TLB_SHOOTDOWN,
     }
   }
 }
@@ -61,6 +66,12 @@ pub fn handle_local() {
 
   if requests & REQUEST_RESCHEDULE != 0 {
     hart::current().request_reschedule();
+  }
+  if requests & REQUEST_TLB_SHOOTDOWN != 0 {
+    tlb::handle_local();
+  }
+  if requests & !(REQUEST_RESCHEDULE | REQUEST_TLB_SHOOTDOWN) != 0 {
+    cpu::halt();
   }
 }
 
