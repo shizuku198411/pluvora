@@ -8,6 +8,7 @@ use crate::arch::riscv64::{
   trap,
 };
 use crate::dtb::Dtb;
+use crate::kernel_state;
 use crate::memory::EarlyFrameAllocator;
 use crate::memory::address_space;
 use crate::platform::{MemoryRegion, PlatformInfo, discover};
@@ -64,12 +65,26 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
 
   let boot_index = hart::initialize_boot_hart(&platform, hart_id)
     .unwrap_or_else(|error| fail("Harts", error.as_str()));
+  let kernel_space = kernel_state::initialize_kernel_address_space(paging.root_frame())
+    .unwrap_or_else(|error| fail("Kernel Objects", error.as_str()));
+  let (object_count, capability_count, capability_space_count) = kernel_state::counts();
+  report::kernel_objects(
+    kernel_space,
+    object_count,
+    capability_count,
+    capability_space_count,
+  );
   address_space::initialize_allocator(asid_bits)
     .unwrap_or_else(|error| fail("ASID", error.as_str()));
   hart::install_kernel_address_space();
   let requested = hart::start_secondaries(&platform, hart_id, paging)
     .unwrap_or_else(|error| fail("Harts", error.as_str()));
   report::hart_bootstrap(boot_index, requested, hart::online_count(&platform));
+
+  let (online_mask, runnable, running) =
+    kernel_state::initialize_scheduler_state(hart::online_mask())
+      .unwrap_or_else(|error| fail("Scheduler", error.as_str()));
+  report::scheduler(online_mask, runnable, running);
 
   report::complete();
   cpu::idle()

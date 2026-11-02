@@ -1,4 +1,5 @@
 use crate::arch::riscv64::paging::PagingInfo;
+use crate::capability::CapabilityHandle;
 use crate::dtb::Dtb;
 use crate::platform::{MemoryRegion, PlatformInfo};
 use crate::support::console;
@@ -38,6 +39,40 @@ pub fn harts(platform: &PlatformInfo, boot_hart_id: usize) {
   if let Some(index) = platform.hart_index(boot_hart_id) {
     usize_field("Boot hart index", index);
   }
+}
+
+pub fn kernel_objects(
+  kernel_space: CapabilityHandle,
+  object_count: usize,
+  capability_count: usize,
+  capability_space_count: usize,
+) {
+  section("Kernel Objects");
+  usize_field("Object capacity", crate::object::MAX_OBJECTS);
+  usize_field("Live objects", object_count);
+  usize_field(
+    "CSpace capacity",
+    crate::capability_space::MAX_CAPABILITY_SPACES,
+  );
+  usize_field("Live CSpaces", capability_space_count);
+  usize_field(
+    "Capability capacity",
+    crate::capability::MAX_CAPABILITY_SLOTS,
+  );
+  usize_field("Live capabilities", capability_count);
+  usize_field("Kernel cap slot", kernel_space.slot() as usize);
+  u64_field(
+    "Kernel cap generation",
+    u64::from(kernel_space.generation()),
+  );
+}
+
+pub fn scheduler(online_mask: u64, runnable: usize, running: usize) {
+  section("Scheduler");
+  u64_field("Online hart mask", online_mask);
+  usize_field("Queue capacity", crate::scheduler::MAX_RUNNABLE_PER_HART);
+  usize_field("Runnable threads", runnable);
+  usize_field("Running threads", running);
 }
 
 pub fn memory_map(platform: &PlatformInfo, kernel_region: MemoryRegion, dtb_region: MemoryRegion) {
