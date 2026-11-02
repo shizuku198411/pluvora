@@ -2,7 +2,10 @@ use crate::capability::{Capability, CapabilityHandle, CapabilityNodeId, Rights};
 use crate::capability_space::{self, CapabilitySpaceId, CapabilitySpaceTable};
 #[cfg(target_arch = "riscv64")]
 use crate::memory::address_space::{AddressSpace, Asid};
-use crate::object::{self, KernelObject, ObjectTable, ObjectType};
+use crate::object::{self, KernelObject, ObjectId, ObjectTable, ObjectType};
+use crate::process::ProcessState;
+use crate::scheduler::{self, SchedulerState, WakeResult};
+use crate::thread::{self, ThreadState};
 
 #[cfg(target_arch = "riscv64")]
 use crate::sync::SpinLock;
@@ -19,6 +22,10 @@ pub enum Error {
   AlreadyInitialized,
   NodeExhausted,
   CommitInvariant,
+  Scheduler(scheduler::Error),
+  SchedulerUninitialized,
+  Thread(thread::Error),
+  ProcessNotAlive,
   RollbackFailed,
 }
 
@@ -32,6 +39,10 @@ impl Error {
       Self::AlreadyInitialized => "bootstrap kernel state is already initialized",
       Self::NodeExhausted => "capability node identity is exhausted",
       Self::CommitInvariant => "capability transaction commit invariant failed",
+      Self::Scheduler(_) => "scheduler operation failed",
+      Self::SchedulerUninitialized => "scheduler is not initialized",
+      Self::Thread(_) => "thread state transition failed",
+      Self::ProcessNotAlive => "owner process is not alive",
       Self::RollbackFailed => "kernel state transaction rollback failed",
     }
   }
@@ -55,11 +66,24 @@ impl From<capability_space::Error> for Error {
   }
 }
 
+impl From<scheduler::Error> for Error {
+  fn from(error: scheduler::Error) -> Self {
+    Self::Scheduler(error)
+  }
+}
+
+impl From<thread::Error> for Error {
+  fn from(error: thread::Error) -> Self {
+    Self::Thread(error)
+  }
+}
+
 pub struct KernelState {
   objects: ObjectTable,
   spaces: CapabilitySpaceTable,
   next_capability_node: u64,
   kernel_address_space: Option<CapabilityHandle>,
+  scheduler: SchedulerState,
 }
 
 impl KernelState {
@@ -69,6 +93,7 @@ impl KernelState {
       spaces: CapabilitySpaceTable::new(),
       next_capability_node: 1,
       kernel_address_space: None,
+      scheduler: SchedulerState::uninitialized(),
     }
   }
 
@@ -292,6 +317,158 @@ impl KernelState {
     self.objects.validate_type(object, expected_type)?;
     Ok(self.objects.get(object)?)
   }
+
+  pub fn initialize_scheduler(&mut self, online_mask: u64) -> Result<(), Error> {
+    if self.scheduler.is_initialized() {
+      return Err(Error::AlreadyInitialized);
+    }
+    self.scheduler.initialize(online_mask)?;
+    Ok(())
+  }
+
+  pub fn scheduler_summary(&self) -> Result<(u64, usize, usize), Error> {
+    let scheduler = self.scheduler()?;
+    Ok((
+      scheduler.online_mask(),
+      scheduler.total_runnable(),
+      scheduler.total_running(),
+    ))
+  }
+
+  fn scheduler(&self) -> Result<&SchedulerState, Error> {
+    self
+      .scheduler
+      .is_initialized()
+      .then_some(&self.scheduler)
+      .ok_or(Error::SchedulerUninitialized)
+  }
+
+  fn scheduler_mut(&mut self) -> Result<&mut SchedulerState, Error> {
+    if !self.scheduler.is_initialized() {
+      return Err(Error::SchedulerUninitialized);
+    }
+    Ok(&mut self.scheduler)
+  }
+
+  fn thread_snapshot(
+    &mut self,
+    id: ObjectId,
+  ) -> Result<(ObjectId, ThreadState, u64, u8, Option<u16>), Error> {
+    let thread = self
+      .objects
+      .get(id)?
+      .as_thread()
+      .ok_or(Error::Object(object::Error::WrongObjectType))?;
+    Ok((
+      thread.process(),
+      thread.state(),
+      thread.affinity(),
+      thread.effective_priority(),
+      thread.running_hart(),
+    ))
+  }
+
+  fn require_process_alive(&self, id: ObjectId) -> Result<(), Error> {
+    let process = self
+      .objects
+      .get(id)?
+      .as_process()
+      .ok_or(Error::Object(object::Error::WrongObjectType))?;
+    if process.state() != ProcessState::Alive {
+      return Err(Error::ProcessNotAlive);
+    }
+    Ok(())
+  }
+
+  pub fn wake_thread(&mut self, thread_id: ObjectId) -> Result<WakeResult, Error> {
+    let (process, state, affinity, priority, _) = self.thread_snapshot(thread_id)?;
+    self.require_process_alive(process)?;
+    if !matches!(state, ThreadState::New | ThreadState::Blocked) {
+      return Err(Error::Thread(thread::Error::InvalidState));
+    }
+
+    let result = self
+      .scheduler_mut()?
+      .enqueue(thread_id, affinity, priority)?;
+    self
+      .objects
+      .get_mut(thread_id)?
+      .as_thread_mut()
+      .ok_or(Error::CommitInvariant)?
+      .make_runnable()
+      .map_err(|_| Error::CommitInvariant)?;
+    Ok(result)
+  }
+
+  pub fn dispatch_next(&mut self, hart: usize) -> Result<Option<ObjectId>, Error> {
+    let candidate = self.scheduler()?.peek_next(hart)?;
+    let Some(thread_id) = candidate else {
+      return Ok(None);
+    };
+    let (_, state, affinity, _, _) = self.thread_snapshot(thread_id)?;
+    let hart_bit = 1u64
+      .checked_shl(hart as u32)
+      .ok_or(Error::CommitInvariant)?;
+    if state != ThreadState::Runnable || affinity & hart_bit == 0 {
+      return Err(Error::CommitInvariant);
+    }
+
+    self.scheduler_mut()?.dispatch_expected(hart, thread_id)?;
+    self
+      .objects
+      .get_mut(thread_id)?
+      .as_thread_mut()
+      .ok_or(Error::CommitInvariant)?
+      .begin_running(hart)
+      .map_err(|_| Error::CommitInvariant)?;
+    Ok(Some(thread_id))
+  }
+
+  pub fn preempt_current(&mut self, hart: usize) -> Result<WakeResult, Error> {
+    let thread_id = self
+      .scheduler()?
+      .running_thread(hart)?
+      .ok_or(Error::Scheduler(scheduler::Error::NoRunningThread))?;
+    let (_, state, affinity, priority, running_hart) = self.thread_snapshot(thread_id)?;
+    if state != ThreadState::Running || running_hart != u16::try_from(hart).ok() {
+      return Err(Error::CommitInvariant);
+    }
+    let result = self.scheduler_mut()?.preempt(hart, affinity, priority)?;
+    self
+      .objects
+      .get_mut(thread_id)?
+      .as_thread_mut()
+      .ok_or(Error::CommitInvariant)?
+      .preempt()
+      .map_err(|_| Error::CommitInvariant)?;
+    Ok(result)
+  }
+
+  pub fn block_current(&mut self, hart: usize) -> Result<ObjectId, Error> {
+    let thread_id = self
+      .scheduler()?
+      .running_thread(hart)?
+      .ok_or(Error::Scheduler(scheduler::Error::NoRunningThread))?;
+    let (_, state, _, _, running_hart) = self.thread_snapshot(thread_id)?;
+    if state != ThreadState::Running || running_hart != u16::try_from(hart).ok() {
+      return Err(Error::CommitInvariant);
+    }
+    let removed = self.scheduler_mut()?.block_running(hart)?;
+    debug_assert_eq!(removed, thread_id);
+    self
+      .objects
+      .get_mut(thread_id)?
+      .as_thread_mut()
+      .ok_or(Error::CommitInvariant)?
+      .block()
+      .map_err(|_| Error::CommitInvariant)?;
+    Ok(thread_id)
+  }
+
+  #[cfg(test)]
+  fn insert_test_object(&mut self, object: KernelObject) -> Result<ObjectId, Error> {
+    Ok(self.objects.insert(object)?)
+  }
 }
 
 impl Default for KernelState {
@@ -325,14 +502,41 @@ pub fn counts() -> (usize, usize, usize) {
   )
 }
 
+#[cfg(target_arch = "riscv64")]
+pub fn initialize_scheduler_state(online_mask: u64) -> Result<(u64, usize, usize), Error> {
+  let mut state = KERNEL_STATE.lock();
+  state.initialize_scheduler(online_mask)?;
+  state.scheduler_summary()
+}
+
 #[cfg(test)]
 mod tests {
   use crate::object::MemoryObject;
+  use crate::process::{Process, ProcessLimits};
+  use crate::thread::{Thread, ThreadState};
 
   use super::*;
 
   fn memory() -> KernelObject {
     KernelObject::Memory(MemoryObject::new(0x8080_0000).unwrap())
+  }
+
+  fn scheduler_state(state: &mut KernelState) -> (ObjectId, ObjectId) {
+    state.initialize_scheduler(0b1111).unwrap();
+    let mut process = Process::new(
+      ObjectId::from_raw_parts(90, 1),
+      state.bootstrap_space(),
+      ProcessLimits::new(4, 4, 8, 8).unwrap(),
+    );
+    process.start().unwrap();
+    let process = state
+      .insert_test_object(KernelObject::Process(process))
+      .unwrap();
+    let thread = Thread::new(process, 0b0101, 8).unwrap();
+    let thread = state
+      .insert_test_object(KernelObject::Thread(thread))
+      .unwrap();
+    (process, thread)
   }
 
   #[test]
@@ -637,5 +841,103 @@ mod tests {
       Err(Error::Capability(crate::capability::Error::StaleHandle))
     ));
     assert_eq!(state.next_capability_node, next_node);
+  }
+
+  #[test]
+  fn sched_020_wake_updates_queue_and_thread_state_together() {
+    let mut state = KernelState::new();
+    let (_, thread) = scheduler_state(&mut state);
+    let wake = state.wake_thread(thread).unwrap();
+    assert!(matches!(wake.target_hart, 0 | 2));
+    assert_eq!(
+      state
+        .objects
+        .get(thread)
+        .unwrap()
+        .as_thread()
+        .unwrap()
+        .state(),
+      ThreadState::Runnable
+    );
+    assert_eq!(state.scheduler.total_runnable(), 1);
+  }
+
+  #[test]
+  fn sched_021_dispatch_updates_running_membership_and_thread_state() {
+    let mut state = KernelState::new();
+    let (_, thread) = scheduler_state(&mut state);
+    let target = state.wake_thread(thread).unwrap().target_hart;
+    assert_eq!(state.dispatch_next(target), Ok(Some(thread)));
+    let object = state.objects.get(thread).unwrap().as_thread().unwrap();
+    assert_eq!(object.state(), ThreadState::Running);
+    assert_eq!(object.running_hart(), Some(target as u16));
+  }
+
+  #[test]
+  fn sched_022_preempt_returns_thread_to_one_queue() {
+    let mut state = KernelState::new();
+    let (_, thread) = scheduler_state(&mut state);
+    let target = state.wake_thread(thread).unwrap().target_hart;
+    state.dispatch_next(target).unwrap();
+    state.preempt_current(target).unwrap();
+    assert_eq!(
+      state
+        .objects
+        .get(thread)
+        .unwrap()
+        .as_thread()
+        .unwrap()
+        .state(),
+      ThreadState::Runnable
+    );
+    assert_eq!(state.scheduler.total_running(), 0);
+    assert_eq!(state.scheduler.total_runnable(), 1);
+  }
+
+  #[test]
+  fn sched_023_block_removes_thread_from_scheduler() {
+    let mut state = KernelState::new();
+    let (_, thread) = scheduler_state(&mut state);
+    let target = state.wake_thread(thread).unwrap().target_hart;
+    state.dispatch_next(target).unwrap();
+    assert_eq!(state.block_current(target), Ok(thread));
+    assert_eq!(
+      state
+        .objects
+        .get(thread)
+        .unwrap()
+        .as_thread()
+        .unwrap()
+        .state(),
+      ThreadState::Blocked
+    );
+    assert_eq!(state.scheduler.total_running(), 0);
+    assert_eq!(state.scheduler.total_runnable(), 0);
+  }
+
+  #[test]
+  fn sched_024_stopping_process_cannot_wake_thread() {
+    let mut state = KernelState::new();
+    let (process, thread) = scheduler_state(&mut state);
+    state
+      .objects
+      .get_mut(process)
+      .unwrap()
+      .as_process_mut()
+      .unwrap()
+      .begin_stop()
+      .unwrap();
+    assert_eq!(state.wake_thread(thread), Err(Error::ProcessNotAlive));
+    assert_eq!(state.scheduler.total_runnable(), 0);
+    assert_eq!(
+      state
+        .objects
+        .get(thread)
+        .unwrap()
+        .as_thread()
+        .unwrap()
+        .state(),
+      ThreadState::New
+    );
   }
 }

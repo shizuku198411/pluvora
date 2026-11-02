@@ -67,6 +67,14 @@ pub fn kernel_objects(
   );
 }
 
+pub fn scheduler(online_mask: u64, runnable: usize, running: usize) {
+  section("Scheduler");
+  u64_field("Online hart mask", online_mask);
+  usize_field("Queue capacity", crate::scheduler::MAX_RUNNABLE_PER_HART);
+  usize_field("Runnable threads", runnable);
+  usize_field("Running threads", running);
+}
+
 pub fn memory_map(platform: &PlatformInfo, kernel_region: MemoryRegion, dtb_region: MemoryRegion) {
   section("Physical Memory");
   console::write_line("  Available RAM:");

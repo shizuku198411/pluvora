@@ -196,6 +196,11 @@ impl ObjectTable {
     slot.object.as_ref().ok_or(Error::InvalidObject)
   }
 
+  pub(crate) fn get_mut(&mut self, id: ObjectId) -> Result<&mut KernelObject, Error> {
+    let slot = self.slot_mut(id)?;
+    slot.object.as_mut().ok_or(Error::InvalidObject)
+  }
+
   pub(crate) fn validate_type(&self, id: ObjectId, expected: ObjectType) -> Result<(), Error> {
     if self.get(id)?.object_type() != expected {
       return Err(Error::WrongObjectType);

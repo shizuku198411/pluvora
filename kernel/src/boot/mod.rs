@@ -81,6 +81,11 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
     .unwrap_or_else(|error| fail("Harts", error.as_str()));
   report::hart_bootstrap(boot_index, requested, hart::online_count(&platform));
 
+  let (online_mask, runnable, running) =
+    kernel_state::initialize_scheduler_state(hart::online_mask())
+      .unwrap_or_else(|error| fail("Scheduler", error.as_str()));
+  report::scheduler(online_mask, runnable, running);
+
   report::complete();
   cpu::idle()
 }

@@ -12,6 +12,7 @@ pub mod memory;
 pub mod object;
 pub mod platform;
 pub mod process;
+pub mod scheduler;
 pub mod sync;
 pub mod thread;
 
