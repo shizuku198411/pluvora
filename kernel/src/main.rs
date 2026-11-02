@@ -10,6 +10,7 @@ use pluvora_kernel::{
 };
 
 global_asm!(include_str!("entry.S"));
+global_asm!(include_str!("arch/riscv64/context.S"));
 global_asm!(include_str!("arch/riscv64/secondary.S"));
 global_asm!(include_str!("arch/riscv64/trap.S"));
 

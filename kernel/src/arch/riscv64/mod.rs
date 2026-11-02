@@ -1,3 +1,4 @@
+pub mod context;
 pub mod hart;
 pub mod ipi;
 pub mod paging;

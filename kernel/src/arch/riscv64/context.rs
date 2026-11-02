@@ -1,0 +1,154 @@
+use core::mem::{offset_of, size_of};
+
+#[cfg(target_arch = "riscv64")]
+use core::{
+  ptr::{addr_of, addr_of_mut},
+  sync::atomic::{AtomicBool, Ordering},
+};
+
+#[cfg(target_arch = "riscv64")]
+use crate::arch::riscv64::hart;
+
+pub const KERNEL_STACK_ALIGNMENT: usize = 16;
+#[cfg(target_arch = "riscv64")]
+pub const SMOKE_STACK_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+  InvalidEntry,
+  InvalidStackTop,
+  HartLocalChanged,
+  SmokeDidNotReturn,
+}
+
+impl Error {
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::InvalidEntry => "context entry address is invalid",
+      Self::InvalidStackTop => "context stack top is invalid",
+      Self::HartLocalChanged => "context switch changed the hart-local identity",
+      Self::SmokeDidNotReturn => "context switch smoke test did not return",
+    }
+  }
+}
+
+#[repr(C)]
+pub struct SavedContext {
+  ra: usize,
+  sp: usize,
+  s: [usize; 12], // s0-s11
+}
+
+impl SavedContext {
+  pub const fn empty() -> Self {
+    Self {
+      ra: 0,
+      sp: 0,
+      s: [0; 12],
+    }
+  }
+
+  pub fn initial(entry: usize, stack_top: usize) -> Result<Self, Error> {
+    if entry == 0 {
+      return Err(Error::InvalidEntry);
+    }
+    if stack_top == 0 || !stack_top.is_multiple_of(KERNEL_STACK_ALIGNMENT) {
+      return Err(Error::InvalidStackTop);
+    }
+    Ok(Self {
+      ra: entry,
+      sp: stack_top,
+      s: [0; 12],
+    })
+  }
+}
+
+const _: () = {
+  assert!(size_of::<SavedContext>() == 14 * size_of::<usize>());
+  assert!(offset_of!(SavedContext, ra) == 0);
+  assert!(offset_of!(SavedContext, sp) == size_of::<usize>());
+  assert!(offset_of!(SavedContext, s) == 2 * size_of::<usize>());
+};
+
+#[cfg(target_arch = "riscv64")]
+unsafe extern "C" {
+  fn switch_context(old: *mut SavedContext, new: *const SavedContext);
+}
+
+#[cfg(target_arch = "riscv64")]
+#[repr(C, align(16))]
+struct SmokeStack([u8; SMOKE_STACK_BYTES]);
+
+#[cfg(target_arch = "riscv64")]
+static mut BOOT_CONTEXT: SavedContext = SavedContext::empty();
+#[cfg(target_arch = "riscv64")]
+static mut SMOKE_CONTEXT: SavedContext = SavedContext::empty();
+#[cfg(target_arch = "riscv64")]
+static mut SMOKE_STACK: SmokeStack = SmokeStack([0; SMOKE_STACK_BYTES]);
+#[cfg(target_arch = "riscv64")]
+static SMOKE_ENTERED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_arch = "riscv64")]
+pub fn run_boot_smoke_test() -> Result<(), Error> {
+  SMOKE_ENTERED.store(false, Ordering::Relaxed);
+  let hart_before = hart::current_index();
+  let stack_base = addr_of!(SMOKE_STACK) as usize;
+  let stack_top = stack_base
+    .checked_add(SMOKE_STACK_BYTES)
+    .ok_or(Error::InvalidStackTop)?;
+  let context = SavedContext::initial(smoke_entry as *const () as usize, stack_top)?;
+
+  // SAFETY: boot executes this test once before scheduler dispatch.
+  // the static contexts and stack are exclusively owned for the complete switch pair.
+  unsafe {
+    addr_of_mut!(SMOKE_CONTEXT).write(context);
+    switch_context(addr_of_mut!(BOOT_CONTEXT), addr_of!(SMOKE_CONTEXT));
+  }
+
+  if !SMOKE_ENTERED.load(Ordering::Acquire) {
+    return Err(Error::SmokeDidNotReturn);
+  }
+  if hart::current_index() != hart_before {
+    return Err(Error::HartLocalChanged);
+  }
+  Ok(())
+}
+
+#[cfg(target_arch = "riscv64")]
+extern "C" fn smoke_entry() -> ! {
+  SMOKE_ENTERED.store(true, Ordering::Release);
+  unsafe {
+    switch_context(addr_of_mut!(SMOKE_CONTEXT), addr_of!(BOOT_CONTEXT));
+  }
+  unreachable!("completed smoke context resumed unexpectedly")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn context_001_saved_layout_matches_assembly_contract() {
+    assert_eq!(size_of::<SavedContext>(), 14 * size_of::<usize>());
+    assert_eq!(offset_of!(SavedContext, ra), 0);
+    assert_eq!(offset_of!(SavedContext, sp), size_of::<usize>());
+    assert_eq!(offset_of!(SavedContext, s), 2 * size_of::<usize>());
+  }
+
+  #[test]
+  fn context_002_initial_context_requires_aligned_stack() {
+    assert!(SavedContext::initial(0x1000, 0x8000).is_ok());
+    assert!(matches!(
+      SavedContext::initial(0x1000, 0x8001),
+      Err(Error::InvalidStackTop)
+    ));
+  }
+
+  #[test]
+  fn context_003_initial_context_requires_entry() {
+    assert!(matches!(
+      SavedContext::initial(0, 0x8000),
+      Err(Error::InvalidEntry)
+    ));
+  }
+}

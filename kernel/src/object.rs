@@ -42,6 +42,22 @@ impl ObjectId {
   pub(crate) const fn generation(self) -> u32 {
     self.generation
   }
+
+  pub(crate) const fn into_raw(self) -> usize {
+    ((self.generation as usize) << 16) | self.slot as usize
+  }
+
+  pub(crate) const fn from_raw(raw: usize) -> Option<Self> {
+    let slot = raw & 0xffff;
+    let generation = raw >> 16;
+    if slot >= MAX_OBJECTS || generation == 0 || generation > u32::MAX as usize {
+      return None;
+    }
+    Some(Self {
+      slot: slot as u16,
+      generation: generation as u32,
+    })
+  }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -405,5 +421,12 @@ mod tests {
     assert!(thread.as_process().is_none());
     assert!(thread.as_memory().is_none());
     assert!(thread.as_address_space().is_none());
+  }
+
+  #[test]
+  fn obj_012_object_id_raw_encoding_preserves_generation() {
+    let id = ObjectId::from_raw_parts(7, 19);
+    assert_eq!(ObjectId::from_raw(id.into_raw()), Some(id));
+    assert_eq!(ObjectId::from_raw(0), None);
   }
 }

@@ -3,7 +3,7 @@ mod report;
 use core::ptr::addr_of;
 
 use crate::arch::riscv64::{
-  hart, ipi,
+  context, hart, ipi,
   paging::{self, KernelLayout},
   trap,
 };
@@ -85,6 +85,9 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
     kernel_state::initialize_scheduler_state(hart::online_mask())
       .unwrap_or_else(|error| fail("Scheduler", error.as_str()));
   report::scheduler(online_mask, runnable, running);
+
+  context::run_boot_smoke_test().unwrap_or_else(|error| fail("Context Switch", error.as_str()));
+  report::context_switch();
 
   report::complete();
   cpu::idle()

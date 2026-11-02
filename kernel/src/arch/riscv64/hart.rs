@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::arch::riscv64::paging::PagingInfo;
 use crate::arch::riscv64::sbi;
 use crate::memory::address_space::Asid;
+use crate::object::ObjectId;
 use crate::platform::{MAX_HARTS, PlatformInfo};
 
 #[cfg(target_arch = "riscv64")]
@@ -33,6 +34,8 @@ enum DepthError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
   InvalidHartIndex,
+  CurrentThreadBusy,
+  CurrentThreadMismatch,
   InvalidStackLayout,
   InvalidSatp,
   HartIdMismatch,
@@ -45,6 +48,8 @@ impl Error {
   pub const fn as_str(self) -> &'static str {
     match self {
       Self::InvalidHartIndex => "invalid dense hart index",
+      Self::CurrentThreadBusy => "hart already has a current thread",
+      Self::CurrentThreadMismatch => "hart current thread identity does not match",
       Self::InvalidStackLayout => "invalid secondary stack layout",
       Self::InvalidSatp => "satp value does not fit the target register",
       Self::HartIdMismatch => "secondary hart ID does not match boot descriptor",
@@ -155,6 +160,26 @@ impl HartLocal {
 
   pub fn has_ipi_requests(&self) -> bool {
     self.pending_ipi_requests.load(Ordering::Acquire) != 0
+  }
+
+  pub fn current_thread(&self) -> Option<ObjectId> {
+    ObjectId::from_raw(self.current_thread.load(Ordering::Acquire))
+  }
+
+  pub fn install_current_thread(&self, thread: ObjectId) -> Result<(), Error> {
+    self
+      .current_thread
+      .compare_exchange(0, thread.into_raw(), Ordering::AcqRel, Ordering::Acquire)
+      .map(|_| ())
+      .map_err(|_| Error::CurrentThreadBusy)
+  }
+
+  pub fn clear_current_thread(&self, expected: ObjectId) -> Result<(), Error> {
+    self
+      .current_thread
+      .compare_exchange(expected.into_raw(), 0, Ordering::AcqRel, Ordering::Acquire)
+      .map(|_| ())
+      .map_err(|_| Error::CurrentThreadMismatch)
   }
 }
 
@@ -652,5 +677,27 @@ mod tests {
     local.request_reschedule();
     assert!(local.take_reschedule_request());
     assert!(!local.take_reschedule_request());
+  }
+
+  #[test]
+  fn sched_030_current_thread_publication_preserves_identity() {
+    let local = HartLocal::empty();
+    let first = ObjectId::from_raw_parts(3, 1);
+    let replacement = ObjectId::from_raw_parts(3, 2);
+
+    assert_eq!(local.current_thread(), None);
+    assert_eq!(local.install_current_thread(first), Ok(()));
+    assert_eq!(local.current_thread(), Some(first));
+    assert_eq!(
+      local.install_current_thread(replacement),
+      Err(Error::CurrentThreadBusy)
+    );
+    assert_eq!(
+      local.clear_current_thread(replacement),
+      Err(Error::CurrentThreadMismatch)
+    );
+    assert_eq!(local.current_thread(), Some(first));
+    assert_eq!(local.clear_current_thread(first), Ok(()));
+    assert_eq!(local.current_thread(), None);
   }
 }

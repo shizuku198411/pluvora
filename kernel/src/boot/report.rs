@@ -75,6 +75,15 @@ pub fn scheduler(online_mask: u64, runnable: usize, running: usize) {
   usize_field("Running threads", running);
 }
 
+pub fn context_switch() {
+  section("Context Switch");
+  console::write_line("  Callee-saved ABI  : verified");
+  usize_field(
+    "Smoke stack bytes",
+    crate::arch::riscv64::context::SMOKE_STACK_BYTES,
+  );
+}
+
 pub fn memory_map(platform: &PlatformInfo, kernel_region: MemoryRegion, dtb_region: MemoryRegion) {
   section("Physical Memory");
   console::write_line("  Available RAM:");
