@@ -1,4 +1,6 @@
 use crate::memory::{PAGE_SIZE, address_space::AddressSpace};
+use crate::process::Process;
+use crate::thread::Thread;
 
 pub const MAX_OBJECTS: usize = 128;
 
@@ -17,10 +19,12 @@ pub enum Error {
 pub enum ObjectType {
   Memory,
   AddressSpace,
+  Process,
+  Thread,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ObjectId {
+pub struct ObjectId {
   slot: u16,
   generation: u32,
 }
@@ -61,6 +65,8 @@ impl MemoryObject {
 pub enum KernelObject {
   Memory(MemoryObject),
   AddressSpace(AddressSpace),
+  Process(Process),
+  Thread(Thread),
 }
 
 impl KernelObject {
@@ -68,20 +74,50 @@ impl KernelObject {
     match self {
       Self::Memory(_) => ObjectType::Memory,
       Self::AddressSpace(_) => ObjectType::AddressSpace,
+      Self::Process(_) => ObjectType::Process,
+      Self::Thread(_) => ObjectType::Thread,
     }
   }
 
   pub const fn as_memory(&self) -> Option<&MemoryObject> {
     match self {
       Self::Memory(memory) => Some(memory),
-      Self::AddressSpace(_) => None,
+      Self::AddressSpace(_) | Self::Process(_) | Self::Thread(_) => None,
     }
   }
 
   pub const fn as_address_space(&self) -> Option<&AddressSpace> {
     match self {
-      Self::Memory(_) => None,
+      Self::Memory(_) | Self::Process(_) | Self::Thread(_) => None,
       Self::AddressSpace(space) => Some(space),
+    }
+  }
+
+  pub const fn as_process(&self) -> Option<&Process> {
+    match self {
+      Self::Process(process) => Some(process),
+      Self::Memory(_) | Self::AddressSpace(_) | Self::Thread(_) => None,
+    }
+  }
+
+  pub fn as_process_mut(&mut self) -> Option<&mut Process> {
+    match self {
+      Self::Process(process) => Some(process),
+      Self::Memory(_) | Self::AddressSpace(_) | Self::Thread(_) => None,
+    }
+  }
+
+  pub const fn as_thread(&self) -> Option<&Thread> {
+    match self {
+      Self::Thread(thread) => Some(thread),
+      Self::Memory(_) | Self::AddressSpace(_) | Self::Process(_) => None,
+    }
+  }
+
+  pub fn as_thread_mut(&mut self) -> Option<&mut Thread> {
+    match self {
+      Self::Thread(thread) => Some(thread),
+      Self::Memory(_) | Self::AddressSpace(_) | Self::Process(_) => None,
     }
   }
 
@@ -232,9 +268,20 @@ impl Default for ObjectTable {
 
 #[cfg(test)]
 mod tests {
+  use crate::capability_space::CapabilitySpaceId;
   use crate::memory::address_space::Asid;
+  use crate::process::{Process, ProcessLimits};
+  use crate::thread::Thread;
 
   use super::*;
+
+  fn process_object() -> Process {
+    Process::new(
+      ObjectId::from_raw_parts(20, 1),
+      CapabilitySpaceId::from_raw_parts_for_test(2, 1),
+      ProcessLimits::new(4, 16, 16, 16).unwrap(),
+    )
+  }
 
   #[test]
   fn obj_001_empty_table_rejects_unknown_identity() {
@@ -323,5 +370,35 @@ mod tests {
       )),
       Err(Error::TableFull)
     ));
+  }
+
+  #[test]
+  fn obj_010_process_and_thread_payloads_preserve_their_type() {
+    let mut table = ObjectTable::new();
+    let process = table
+      .insert(KernelObject::Process(process_object()))
+      .unwrap();
+    let thread = Thread::new(process, 1, 8).unwrap();
+    let thread = table.insert(KernelObject::Thread(thread)).unwrap();
+    assert_eq!(
+      table.get(process).unwrap().object_type(),
+      ObjectType::Process
+    );
+    assert_eq!(table.get(thread).unwrap().object_type(), ObjectType::Thread);
+  }
+
+  #[test]
+  fn obj_011_typed_accessors_do_not_cross_object_types() {
+    let process = KernelObject::Process(process_object());
+    assert!(process.as_process().is_some());
+    assert!(process.as_thread().is_none());
+    assert!(process.as_memory().is_none());
+    assert!(process.as_address_space().is_none());
+
+    let thread = KernelObject::Thread(Thread::new(ObjectId::from_raw_parts(21, 1), 1, 8).unwrap());
+    assert!(thread.as_thread().is_some());
+    assert!(thread.as_process().is_none());
+    assert!(thread.as_memory().is_none());
+    assert!(thread.as_address_space().is_none());
   }
 }

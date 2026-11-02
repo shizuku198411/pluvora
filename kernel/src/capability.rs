@@ -309,6 +309,12 @@ pub const fn valid_rights(object_type: ObjectType) -> Rights {
       .union(Rights::GRANT)
       .union(Rights::REVOKE)
       .union(Rights::DESTROY),
+    ObjectType::Process | ObjectType::Thread => Rights::READ
+      .union(Rights::WRITE)
+      .union(Rights::TRANSFER)
+      .union(Rights::GRANT)
+      .union(Rights::REVOKE)
+      .union(Rights::DESTROY),
   }
 }
 
@@ -490,5 +496,15 @@ mod tests {
     let derived_capability = space.snapshot(derived).unwrap();
     assert_eq!(derived_capability.parent(), Some(parent_capability.node()));
     assert_ne!(derived_capability.node(), parent_capability.node());
+  }
+
+  #[test]
+  fn cap_014_process_and_thread_rights_reject_memory_operations() {
+    for object_type in [ObjectType::Process, ObjectType::Thread] {
+      assert!(!valid_rights(object_type).contains(Rights::MAP));
+      assert!(!valid_rights(object_type).contains(Rights::EXECUTE));
+      assert!(valid_rights(object_type).contains(Rights::READ));
+      assert!(valid_rights(object_type).contains(Rights::WRITE));
+    }
   }
 }

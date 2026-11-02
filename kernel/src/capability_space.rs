@@ -9,6 +9,11 @@ pub struct CapabilitySpaceId {
 }
 
 impl CapabilitySpaceId {
+  #[cfg(test)]
+  pub(crate) const fn from_raw_parts_for_test(slot: u16, generation: u32) -> Self {
+    Self { slot, generation }
+  }
+
   const fn bootstrap() -> Self {
     Self {
       slot: 0,
