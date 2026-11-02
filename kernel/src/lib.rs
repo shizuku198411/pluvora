@@ -4,8 +4,11 @@
 extern crate std;
 
 pub mod arch;
+pub mod capability;
 pub mod dtb;
+pub mod kernel_state;
 pub mod memory;
+pub mod object;
 pub mod platform;
 pub mod sync;
 
