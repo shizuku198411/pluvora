@@ -5,7 +5,7 @@ use core::ptr;
 use core::arch::asm;
 
 use crate::memory::{EarlyFrameAllocator, Error as MemoryError, PAGE_SIZE};
-use crate::platform::MemoryRegion;
+use crate::platform::{MemoryRegion, PlatformInfo};
 
 const ENTRIES_PER_TABLE: usize = 512;
 const VPN_MASK: u64 = 0x1ff;
@@ -113,7 +113,9 @@ impl PagingInfo {
 
 pub fn build(
   allocator: &mut EarlyFrameAllocator<'_>,
+  platform: &PlatformInfo,
   layout: KernelLayout,
+  kernel: MemoryRegion,
   dtb: MemoryRegion,
 ) -> Result<PagingInfo, Error> {
   let mut mapper = Mapper::new(allocator)?;
@@ -125,6 +127,7 @@ pub fn build(
   }
   mapper.map_identity(layout.bss, Permissions::ReadWrite)?;
   mapper.map_identity(dtb, Permissions::ReadOnly)?;
+  mapper.map_usable_ram(platform, kernel, dtb)?;
 
   Ok(PagingInfo {
     root_frame: mapper.root_frame,
@@ -200,6 +203,37 @@ impl<'allocator, 'memory> Mapper<'allocator, 'memory> {
     Ok(())
   }
 
+  fn map_usable_ram(
+    &mut self,
+    platform: &PlatformInfo,
+    kernel: MemoryRegion,
+    dtb: MemoryRegion,
+  ) -> Result<(), Error> {
+    for memory in platform.memory_regions() {
+      let end = align_down(memory.end().ok_or(Error::InvalidRegion)?);
+      let mut address = align_up(memory.base)?;
+      while address < end {
+        let page = MemoryRegion {
+          base: address,
+          size: PAGE_SIZE,
+        };
+        let reserved = platform
+          .reserved_regions()
+          .iter()
+          .copied()
+          .chain([kernel, dtb])
+          .try_fold(false, |found, region| {
+            Ok::<bool, Error>(found || regions_overlap(page, region)?)
+          })?;
+        if !reserved {
+          self.map_page(address, address, Permissions::ReadWrite)?;
+        }
+        address = address.checked_add(PAGE_SIZE).ok_or(Error::InvalidRegion)?;
+      }
+    }
+    Ok(())
+  }
+
   fn map_page(
     &mut self,
     virtual_address: u64,
@@ -246,6 +280,12 @@ impl<'allocator, 'memory> Mapper<'allocator, 'memory> {
     self.mapped_pages += 1;
     Ok(())
   }
+}
+
+fn regions_overlap(left: MemoryRegion, right: MemoryRegion) -> Result<bool, Error> {
+  let left_end = left.end().ok_or(Error::InvalidRegion)?;
+  let right_end = right.end().ok_or(Error::InvalidRegion)?;
+  Ok(left.base < right_end && right.base < left_end)
 }
 
 fn allocate_table_frame(allocator: &mut EarlyFrameAllocator<'_>) -> Result<u64, Error> {
@@ -468,6 +508,34 @@ mod tests {
     assert_eq!(
       satp_value_for(0x8020_0000, 0x1234),
       Ok((SATP_MODE_SV39 << SATP_MODE_SHIFT) | (0x1234 << SATP_ASID_SHIFT) | 0x80200)
+    );
+  }
+
+  #[test]
+  fn vm_023_runtime_mapping_overlap_uses_half_open_ranges() {
+    let page = MemoryRegion {
+      base: 0x4000,
+      size: PAGE_SIZE,
+    };
+    assert_eq!(
+      regions_overlap(
+        page,
+        MemoryRegion {
+          base: 0x4fff,
+          size: 2,
+        }
+      ),
+      Ok(true)
+    );
+    assert_eq!(
+      regions_overlap(
+        page,
+        MemoryRegion {
+          base: 0x5000,
+          size: PAGE_SIZE,
+        }
+      ),
+      Ok(false)
     );
   }
 }

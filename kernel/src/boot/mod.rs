@@ -11,6 +11,7 @@ use crate::dtb::Dtb;
 use crate::kernel_state;
 use crate::memory::EarlyFrameAllocator;
 use crate::memory::address_space;
+use crate::memory::{frame_allocator, kernel_stack};
 use crate::platform::{MemoryRegion, PlatformInfo, discover};
 use crate::support::cpu;
 
@@ -47,7 +48,7 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
     .unwrap_or_else(|error| fail("Memory", error.as_str()));
 
   let layout = kernel_layout().unwrap_or_else(|| fail("Paging", "invalid kernel layout"));
-  let paging = paging::build(&mut allocator, layout, dtb_region)
+  let paging = paging::build(&mut allocator, &platform, layout, kernel_region, dtb_region)
     .unwrap_or_else(|error| fail("Paging", error.as_str()));
   report::paging(&paging);
 
@@ -65,6 +66,20 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
 
   let boot_index = hart::initialize_boot_hart(&platform, hart_id)
     .unwrap_or_else(|error| fail("Harts", error.as_str()));
+  let free_before = frame_allocator::initialize(&allocator)
+    .unwrap_or_else(|error| fail("Runtime Memory", error.as_str()));
+  let stack = kernel_stack::KernelStack::allocate()
+    .unwrap_or_else(|error| fail("Kernel Stack", error.as_str()));
+  let stack_top = stack.top();
+  stack
+    .release()
+    .unwrap_or_else(|error| fail("Kernel Stack", error.as_str()));
+  let free_after =
+    frame_allocator::free_frames().unwrap_or_else(|error| fail("Runtime Memory", error.as_str()));
+  if free_before != free_after {
+    fail("runtime Memory", "kernel stack round-trip leaked frames");
+  }
+  report::runtime_memory(free_after, stack_top);
   let kernel_space = kernel_state::initialize_kernel_address_space(paging.root_frame())
     .unwrap_or_else(|error| fail("Kernel Objects", error.as_str()));
   let (object_count, capability_count, capability_space_count) = kernel_state::counts();

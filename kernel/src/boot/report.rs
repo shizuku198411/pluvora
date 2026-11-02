@@ -47,23 +47,28 @@ pub fn kernel_objects(
   capability_count: usize,
   capability_space_count: usize,
 ) {
+  const FIELD_WIDTH: usize = 21;
+
   section("Kernel Objects");
-  usize_field("Object capacity", crate::object::MAX_OBJECTS);
-  usize_field("Live objects", object_count);
-  usize_field(
+  usize_field_with_width("Object capacity", crate::object::MAX_OBJECTS, FIELD_WIDTH);
+  usize_field_with_width("Live objects", object_count, FIELD_WIDTH);
+  usize_field_with_width(
     "CSpace capacity",
     crate::capability_space::MAX_CAPABILITY_SPACES,
+    FIELD_WIDTH,
   );
-  usize_field("Live CSpaces", capability_space_count);
-  usize_field(
+  usize_field_with_width("Live CSpaces", capability_space_count, FIELD_WIDTH);
+  usize_field_with_width(
     "Capability capacity",
     crate::capability::MAX_CAPABILITY_SLOTS,
+    FIELD_WIDTH,
   );
-  usize_field("Live capabilities", capability_count);
-  usize_field("Kernel cap slot", kernel_space.slot() as usize);
-  u64_field(
+  usize_field_with_width("Live capabilities", capability_count, FIELD_WIDTH);
+  usize_field_with_width("Kernel cap slot", kernel_space.slot() as usize, FIELD_WIDTH);
+  u64_field_with_width(
     "Kernel cap generation",
     u64::from(kernel_space.generation()),
+    FIELD_WIDTH,
   );
 }
 
@@ -82,6 +87,16 @@ pub fn context_switch() {
     "Smoke stack bytes",
     crate::arch::riscv64::context::SMOKE_STACK_BYTES,
   );
+}
+
+pub fn runtime_memory(free_frames: usize, stack_top: usize) {
+  section("Runtime Memory");
+  usize_field("Free frames", free_frames);
+  usize_field(
+    "Kernel stack pages",
+    crate::memory::kernel_stack::KERNEL_STACK_PAGES,
+  );
+  usize_field("Stack top alignment", stack_top & 0xf);
 }
 
 pub fn memory_map(platform: &PlatformInfo, kernel_region: MemoryRegion, dtb_region: MemoryRegion) {
@@ -158,18 +173,26 @@ fn section(title: &str) {
 }
 
 fn usize_field(label: &str, value: usize) {
+  usize_field_with_width(label, value, 18);
+}
+
+fn usize_field_with_width(label: &str, value: usize, field_width: usize) {
   console::write("  ");
   console::write(label);
-  write_padding(label.len());
+  write_padding(label.len(), field_width);
   console::write(": ");
   console::write_hex_usize(value);
   console::newline();
 }
 
 fn u64_field(label: &str, value: u64) {
+  u64_field_with_width(label, value, 18);
+}
+
+fn u64_field_with_width(label: &str, value: u64, field_width: usize) {
   console::write("  ");
   console::write(label);
-  write_padding(label.len());
+  write_padding(label.len(), field_width);
   console::write(": ");
   console::write_hex_u64(value);
   console::newline();
@@ -186,9 +209,8 @@ fn region_field(label: &str, region: MemoryRegion) {
   console::newline();
 }
 
-fn write_padding(label_width: usize) {
-  const FIELD_WIDTH: usize = 18;
-  for _ in label_width..FIELD_WIDTH {
+fn write_padding(label_width: usize, field_width: usize) {
+  for _ in label_width..field_width {
     console::write(" ");
   }
 }
