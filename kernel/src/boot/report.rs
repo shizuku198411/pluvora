@@ -45,10 +45,16 @@ pub fn kernel_objects(
   kernel_space: CapabilityHandle,
   object_count: usize,
   capability_count: usize,
+  capability_space_count: usize,
 ) {
   section("Kernel Objects");
   usize_field("Object capacity", crate::object::MAX_OBJECTS);
   usize_field("Live objects", object_count);
+  usize_field(
+    "CSpace capacity",
+    crate::capability_space::MAX_CAPABILITY_SPACES,
+  );
+  usize_field("Live CSpaces", capability_space_count);
   usize_field(
     "Capability capacity",
     crate::capability::MAX_CAPABILITY_SLOTS,

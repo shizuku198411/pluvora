@@ -65,10 +65,15 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
 
   let boot_index = hart::initialize_boot_hart(&platform, hart_id)
     .unwrap_or_else(|error| fail("Harts", error.as_str()));
-  let kerlel_space = kernel_state::initialize_kernel_address_space(paging.root_frame())
+  let kernel_space = kernel_state::initialize_kernel_address_space(paging.root_frame())
     .unwrap_or_else(|error| fail("Kernel Objects", error.as_str()));
-  let (object_count, capability_count) = kernel_state::counts();
-  report::kernel_objects(kerlel_space, object_count, capability_count);
+  let (object_count, capability_count, capability_space_count) = kernel_state::counts();
+  report::kernel_objects(
+    kernel_space,
+    object_count,
+    capability_count,
+    capability_space_count,
+  );
   address_space::initialize_allocator(asid_bits)
     .unwrap_or_else(|error| fail("ASID", error.as_str()));
   hart::install_kernel_address_space();

@@ -62,11 +62,74 @@ impl CapabilityHandle {
   }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CapabilityNodeId(u64);
+
+impl CapabilityNodeId {
+  pub(crate) const fn new(value: u64) -> Option<Self> {
+    if value == 0 { None } else { Some(Self(value)) }
+  }
+}
+
 #[derive(Clone, Copy)]
-struct Capability {
+pub(crate) struct Capability {
   object: ObjectId,
   object_type: ObjectType,
   rights: Rights,
+  node: CapabilityNodeId,
+  parent: Option<CapabilityNodeId>,
+}
+
+impl Capability {
+  pub(crate) fn initial(
+    object: ObjectId,
+    object_type: ObjectType,
+    rights: Rights,
+    node: CapabilityNodeId,
+  ) -> Result<Self, Error> {
+    validate_rights(object_type, rights)?;
+    Ok(Self {
+      object,
+      object_type,
+      rights,
+      node,
+      parent: None,
+    })
+  }
+
+  pub(crate) fn derived(
+    parent: Self,
+    rights: Rights,
+    node: CapabilityNodeId,
+  ) -> Result<Self, Error> {
+    validate_rights(parent.object_type, rights)?;
+    if !parent.rights.contains(Rights::GRANT) || !rights.is_subset_of(parent.rights) {
+      return Err(Error::RightsDenied);
+    }
+    Ok(Self {
+      object: parent.object,
+      object_type: parent.object_type,
+      rights,
+      node,
+      parent: Some(parent.node),
+    })
+  }
+
+  pub(crate) const fn object(self) -> ObjectId {
+    self.object
+  }
+
+  pub(crate) const fn rights(self) -> Rights {
+    self.rights
+  }
+
+  pub(crate) const fn node(self) -> CapabilityNodeId {
+    self.node
+  }
+
+  pub(crate) const fn parent(self) -> Option<CapabilityNodeId> {
+    self.parent
+  }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,13 +178,9 @@ impl CapabilitySpace {
     object: ObjectId,
     object_type: ObjectType,
     rights: Rights,
+    node: CapabilityNodeId,
   ) -> Result<CapabilityHandle, Error> {
-    validate_rights(object_type, rights)?;
-    self.insert(Capability {
-      object,
-      object_type,
-      rights,
-    })
+    self.insert_existing(Capability::initial(object, object_type, rights, node)?)
   }
 
   pub(crate) fn lookup(
@@ -145,29 +204,26 @@ impl CapabilitySpace {
     Ok((capability.object, capability.object_type))
   }
 
-  pub(crate) fn derive_local(
-    &mut self,
-    parent: CapabilityHandle,
-    rights: Rights,
-  ) -> Result<(CapabilityHandle, ObjectId), Error> {
-    let parent = *self.capability(parent)?;
-    validate_rights(parent.object_type, rights)?;
-    if !parent.rights.contains(Rights::SHARE) {
-      return Err(Error::RightsDenied);
-    }
-    if !rights.is_subset_of(parent.rights) {
-      return Err(Error::RightsDenied);
-    }
-
-    let handle = self.insert(Capability {
-      object: parent.object,
-      object_type: parent.object_type,
-      rights,
-    })?;
-    Ok((handle, parent.object))
+  pub(crate) fn snapshot(&self, handle: CapabilityHandle) -> Result<Capability, Error> {
+    self.capability(handle).copied()
   }
 
-  pub(crate) fn remove(&mut self, handle: CapabilityHandle) -> Result<ObjectId, Error> {
+  pub(crate) fn has_free_slot(&self) -> bool {
+    self
+      .slots
+      .iter()
+      .any(|slot| slot.capability.is_none() && !slot.quarantined)
+  }
+
+  pub(crate) fn insert_existing(
+    &mut self,
+    capability: Capability,
+  ) -> Result<CapabilityHandle, Error> {
+    validate_rights(capability.object_type, capability.rights)?;
+    self.insert(capability)
+  }
+
+  pub(crate) fn remove_full(&mut self, handle: CapabilityHandle) -> Result<Capability, Error> {
     let index = handle.slot as usize;
     let slot = self.slots.get_mut(index).ok_or(Error::InvalidHandle)?;
     if slot.quarantined || slot.generation != handle.generation {
@@ -180,7 +236,23 @@ impl CapabilitySpace {
       Some(generation) => slot.generation = generation,
       None => slot.quarantined = true,
     }
-    Ok(capability.object)
+    Ok(capability)
+  }
+
+  pub(crate) fn derive_local(
+    &mut self,
+    parent: CapabilityHandle,
+    rights: Rights,
+    node: CapabilityNodeId,
+  ) -> Result<(CapabilityHandle, ObjectId), Error> {
+    let parent = *self.capability(parent)?;
+    let derived = Capability::derived(parent, rights, node)?;
+    let handle = self.insert_existing(derived)?;
+    Ok((handle, parent.object))
+  }
+
+  pub(crate) fn remove(&mut self, handle: CapabilityHandle) -> Result<ObjectId, Error> {
+    self.remove_full(handle).map(Capability::object)
   }
 
   pub const fn live_count(&self) -> usize {
@@ -253,10 +325,14 @@ mod tests {
 
   const OBJECT: ObjectId = ObjectId::from_raw_parts(7, 3);
 
+  fn node(value: u64) -> CapabilityNodeId {
+    CapabilityNodeId::new(value).unwrap()
+  }
+
   fn memory_space(rights: Rights) -> (CapabilitySpace, CapabilityHandle) {
     let mut space = CapabilitySpace::new();
     let handle = space
-      .insert_initial(OBJECT, ObjectType::Memory, rights)
+      .insert_initial(OBJECT, ObjectType::Memory, rights, node(1))
       .unwrap();
     (space, handle)
   }
@@ -286,28 +362,28 @@ mod tests {
 
   #[test]
   fn cap_003_derivation_cannot_amplify_rights() {
-    let parent_rights = Rights::READ.union(Rights::SHARE);
+    let parent_rights = Rights::READ.union(Rights::GRANT);
     let (mut space, parent) = memory_space(parent_rights);
     assert_eq!(
-      space.derive_local(parent, Rights::READ.union(Rights::WRITE)),
+      space.derive_local(parent, Rights::READ.union(Rights::WRITE), node(2)),
       Err(Error::RightsDenied)
     );
   }
 
   #[test]
-  fn cap_004_derivation_requires_share_authority() {
+  fn cap_004_derivation_requires_grant_authority() {
     let (mut space, parent) = memory_space(Rights::READ);
     assert_eq!(
-      space.derive_local(parent, Rights::READ),
+      space.derive_local(parent, Rights::READ, node(2)),
       Err(Error::RightsDenied)
     );
   }
 
   #[test]
   fn cap_005_derived_capability_may_reduce_rights() {
-    let parent_rights = Rights::READ.union(Rights::WRITE).union(Rights::SHARE);
+    let parent_rights = Rights::READ.union(Rights::WRITE).union(Rights::GRANT);
     let (mut space, parent) = memory_space(parent_rights);
-    let (derived, object) = space.derive_local(parent, Rights::READ).unwrap();
+    let (derived, object) = space.derive_local(parent, Rights::READ, node(2)).unwrap();
     assert_eq!(object, OBJECT);
     assert_eq!(
       space.lookup(derived, ObjectType::Memory, Rights::READ),
@@ -320,7 +396,7 @@ mod tests {
     let (mut space, old) = memory_space(Rights::READ);
     assert_eq!(space.remove(old), Ok(OBJECT));
     let new = space
-      .insert_initial(OBJECT, ObjectType::Memory, Rights::READ)
+      .insert_initial(OBJECT, ObjectType::Memory, Rights::READ, node(2))
       .unwrap();
     assert_eq!(old.slot(), new.slot());
     assert_ne!(old.generation(), new.generation());
@@ -334,11 +410,11 @@ mod tests {
   fn cap_007_object_specific_rights_are_enforced() {
     let mut space = CapabilitySpace::new();
     assert_eq!(
-      space.insert_initial(OBJECT, ObjectType::AddressSpace, Rights::READ),
+      space.insert_initial(OBJECT, ObjectType::AddressSpace, Rights::READ, node(1),),
       Err(Error::InvalidRights)
     );
     assert_eq!(
-      space.insert_initial(OBJECT, ObjectType::Memory, Rights::CREATE),
+      space.insert_initial(OBJECT, ObjectType::Memory, Rights::CREATE, node(1)),
       Err(Error::InvalidRights)
     );
   }
@@ -357,17 +433,17 @@ mod tests {
   fn cap_009_empty_rights_are_rejected() {
     let mut space = CapabilitySpace::new();
     assert_eq!(
-      space.insert_initial(OBJECT, ObjectType::Memory, Rights::empty()),
+      space.insert_initial(OBJECT, ObjectType::Memory, Rights::empty(), node(1)),
       Err(Error::InvalidRights)
     );
   }
 
   #[test]
   fn cap_010_failed_derivation_does_not_consume_a_slot() {
-    let (mut space, parent) = memory_space(Rights::READ.union(Rights::SHARE));
+    let (mut space, parent) = memory_space(Rights::READ.union(Rights::GRANT));
     let stale = CapabilityHandle::from_raw_parts(parent.slot(), parent.generation() + 1);
     assert_eq!(
-      space.derive_local(stale, Rights::READ),
+      space.derive_local(stale, Rights::READ, node(2)),
       Err(Error::StaleHandle)
     );
     assert_eq!(space.live_count(), 1);
@@ -376,13 +452,23 @@ mod tests {
   #[test]
   fn cap_011_full_space_rejects_another_capability() {
     let mut space = CapabilitySpace::new();
-    for _ in 0..MAX_CAPABILITY_SLOTS {
+    for index in 0..MAX_CAPABILITY_SLOTS {
       space
-        .insert_initial(OBJECT, ObjectType::Memory, Rights::READ)
+        .insert_initial(
+          OBJECT,
+          ObjectType::Memory,
+          Rights::READ,
+          node(index as u64 + 1),
+        )
         .unwrap();
     }
     assert_eq!(
-      space.insert_initial(OBJECT, ObjectType::Memory, Rights::READ),
+      space.insert_initial(
+        OBJECT,
+        ObjectType::Memory,
+        Rights::READ,
+        node(MAX_CAPABILITY_SLOTS as u64 + 1),
+      ),
       Err(Error::SpaceFull)
     );
   }
@@ -393,5 +479,16 @@ mod tests {
     assert_eq!(space.remove(handle), Ok(OBJECT));
     assert_eq!(space.remove(handle), Err(Error::StaleHandle));
     assert_eq!(space.live_count(), 0);
+  }
+
+  #[test]
+  fn cap_013_derivation_records_parent_node() {
+    let parent_rights = Rights::READ.union(Rights::GRANT);
+    let (mut space, parent) = memory_space(parent_rights);
+    let (derived, _) = space.derive_local(parent, Rights::READ, node(2)).unwrap();
+    let parent_capability = space.snapshot(parent).unwrap();
+    let derived_capability = space.snapshot(derived).unwrap();
+    assert_eq!(derived_capability.parent(), Some(parent_capability.node()));
+    assert_ne!(derived_capability.node(), parent_capability.node());
   }
 }

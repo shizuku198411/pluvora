@@ -176,6 +176,14 @@ impl ObjectTable {
     Ok(())
   }
 
+  pub(crate) fn can_add_capability_reference(&self, id: ObjectId) -> Result<(), Error> {
+    self
+      .capability_references(id)?
+      .checked_add(1)
+      .map(|_| ())
+      .ok_or(Error::ReferenceOverflow)
+  }
+
   pub(crate) fn remove_capability_reference(&mut self, id: ObjectId) -> Result<(), Error> {
     let slot = self.slot_mut(id)?;
     slot.capability_references = slot
