@@ -3,14 +3,16 @@ mod report;
 use core::ptr::addr_of;
 
 use crate::arch::riscv64::{
-  hart, ipi,
+  context, hart, ipi,
   paging::{self, KernelLayout},
-  trap,
+  timer, trap,
 };
 use crate::dtb::Dtb;
 use crate::kernel_state;
+use crate::kernel_thread;
 use crate::memory::EarlyFrameAllocator;
 use crate::memory::address_space;
+use crate::memory::{frame_allocator, kernel_stack};
 use crate::platform::{MemoryRegion, PlatformInfo, discover};
 use crate::support::cpu;
 
@@ -47,7 +49,7 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
     .unwrap_or_else(|error| fail("Memory", error.as_str()));
 
   let layout = kernel_layout().unwrap_or_else(|| fail("Paging", "invalid kernel layout"));
-  let paging = paging::build(&mut allocator, layout, dtb_region)
+  let paging = paging::build(&mut allocator, &platform, layout, kernel_region, dtb_region)
     .unwrap_or_else(|error| fail("Paging", error.as_str()));
   report::paging(&paging);
 
@@ -62,9 +64,44 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
   let stvec = trap::install();
   ipi::enable_local();
   report::trap_ready(stvec);
+  let scratch =
+    trap::idle_scratch().unwrap_or_else(|error| fail("User Trap Boundary", error.as_str()));
+  report::user_trap_boundary(scratch);
 
   let boot_index = hart::initialize_boot_hart(&platform, hart_id)
     .unwrap_or_else(|error| fail("Harts", error.as_str()));
+  timer::initialize_frequency(platform.timebase_frequency())
+    .unwrap_or_else(|error| fail("Timer", error.as_str()));
+  let timer_deadline =
+    timer::initialize_local().unwrap_or_else(|error| fail("Timer", error.as_str()));
+  let free_before = frame_allocator::initialize(&allocator)
+    .unwrap_or_else(|error| fail("Runtime Memory", error.as_str()));
+  let stack = kernel_stack::KernelStack::allocate()
+    .unwrap_or_else(|error| fail("Kernel Stack", error.as_str()));
+  let stack_top = stack.top();
+  stack
+    .release()
+    .unwrap_or_else(|error| fail("Kernel Stack", error.as_str()));
+  let free_after =
+    frame_allocator::free_frames().unwrap_or_else(|error| fail("Runtime Memory", error.as_str()));
+  if free_before != free_after {
+    fail("runtime Memory", "kernel stack round-trip leaked frames");
+  }
+  report::runtime_memory(free_after, stack_top);
+  let user_table =
+    crate::memory::user_page_table::UserPageTable::clone_kernel_root(paging.root_frame())
+      .unwrap_or_else(|error| fail("User Address Space", error.as_str()));
+  let user_root = user_table.root_frame();
+  let owned_frames = user_table.owned_frames();
+  user_table
+    .release()
+    .unwrap_or_else(|error| fail("User Address Space", error.as_str()));
+  let free_after_user = frame_allocator::free_frames()
+    .unwrap_or_else(|error| fail("User Address Space", error.as_str()));
+  if free_after_user != free_after {
+    fail("User Address Space", "Page Table smoke leaked frames");
+  }
+  report::user_address_space(user_root, owned_frames);
   let kernel_space = kernel_state::initialize_kernel_address_space(paging.root_frame())
     .unwrap_or_else(|error| fail("Kernel Objects", error.as_str()));
   let (object_count, capability_count, capability_space_count) = kernel_state::counts();
@@ -80,14 +117,189 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
   let requested = hart::start_secondaries(&platform, hart_id, paging)
     .unwrap_or_else(|error| fail("Harts", error.as_str()));
   report::hart_bootstrap(boot_index, requested, hart::online_count(&platform));
+  let timer_tick =
+    timer::run_boot_smoke_test().unwrap_or_else(|error| fail("Timer", error.as_str()));
+  if !hart::current().take_reschedule_request() {
+    fail(
+      "Timer",
+      "timer interrupt did not publish reschedule request",
+    );
+  }
+  report::timer(platform.timebase_frequency(), timer_deadline, timer_tick);
 
   let (online_mask, runnable, running) =
     kernel_state::initialize_scheduler_state(hart::online_mask())
       .unwrap_or_else(|error| fail("Scheduler", error.as_str()));
   report::scheduler(online_mask, runnable, running);
 
+  context::run_boot_smoke_test().unwrap_or_else(|error| fail("Context Switch", error.as_str()));
+  report::context_switch();
+
+  let process = kernel_state::initialize_bootstrap_process()
+    .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  let text_memory = kernel_state::create_memory(kernel_state::bootstrap_space(), process.authority)
+    .unwrap_or_else(|error| fail("Memory Object", error.as_str()));
+  report::memory_object(text_memory.object, text_memory.capability);
+  let initialized_image = kernel_state::initialize_user_image(
+    process.space,
+    text_memory.capability,
+    crate::user_image::INITIAL_USER_IMAGE,
+  )
+  .unwrap_or_else(|error| fail("User Image", error.as_str()));
+  report::initialized_user_image(initialized_image);
+  let stack_memory =
+    kernel_state::create_memory(kernel_state::bootstrap_space(), process.authority)
+      .unwrap_or_else(|error| fail("Memory Object", error.as_str()));
+  let user_space = kernel_state::create_user_address_space(
+    kernel_state::bootstrap_space(),
+    process.authority,
+    paging.root_frame(),
+  )
+  .unwrap_or_else(|error| fail("User Mapping", error.as_str()));
+  let text_mapping = kernel_state::map_memory(
+    process.space,
+    user_space.capability,
+    text_memory.capability,
+    crate::memory::user_page_table::USER_TEXT_BASE,
+    crate::arch::riscv64::paging::UserPermissions::ReadExecute,
+  )
+  .unwrap_or_else(|error| fail("User Mapping", error.as_str()));
+  let stack_mapping = kernel_state::map_memory(
+    process.space,
+    user_space.capability,
+    stack_memory.capability,
+    crate::memory::user_page_table::USER_STACK_BASE,
+    crate::arch::riscv64::paging::UserPermissions::ReadWrite,
+  )
+  .unwrap_or_else(|error| fail("User Mapping", error.as_str()));
+  if text_mapping.address_space != stack_mapping.address_space {
+    fail(
+      "User Mapping",
+      "user image mappings use different Address Spaces",
+    );
+  }
+  report::user_image(text_mapping, stack_mapping);
+  let affinity = 1u64
+    .checked_shl(boot_index as u32)
+    .unwrap_or_else(|| fail("Kernel Thread", "invalid boot hart affinity"));
+  let attached = kernel_state::attach_address_space(
+    kernel_state::bootstrap_space(),
+    process.authority,
+    process.space,
+    user_space.capability,
+  )
+  .unwrap_or_else(|error| fail("User Process", error.as_str()));
+  let user_thread = kernel_state::create_user_thread(
+    kernel_state::bootstrap_space(),
+    process.authority,
+    affinity,
+    crate::thread::MIN_PRIORITY,
+  )
+  .unwrap_or_else(|error| fail("User Thread", error.as_str()));
+  let second_user_thread = kernel_state::create_user_thread(
+    kernel_state::bootstrap_space(),
+    process.authority,
+    affinity,
+    crate::thread::MIN_PRIORITY,
+  )
+  .unwrap_or_else(|error| fail("User Thread", error.as_str()));
+  report::prepared_user_thread(attached, user_thread);
+  kernel_thread::reset_smoke_state();
+  let thread = kernel_state::create_thread(
+    kernel_state::bootstrap_space(),
+    process.authority,
+    affinity,
+    crate::thread::MIN_PRIORITY,
+    kernel_thread::smoke_entry_address(),
+  )
+  .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  let wake = kernel_state::wake_thread(thread.object)
+    .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  if wake.target_hart != boot_index {
+    fail("Kernel Thread", "smoke Thread selected a remote hart");
+  }
+  let dispatched = kernel_state::dispatch_current_hart_once()
+    .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  if dispatched != Some(thread.object)
+    || !kernel_thread::smoke_entered()
+    || kernel_thread::smoke_preempted()
+    || kernel_thread::smoke_resumed()
+  {
+    fail("Kernel Thread", "smoke Thread was not timer-preempted");
+  }
+  let (_, runnable, running) = kernel_state::global_scheduler_summary()
+    .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  if runnable != 1 || running != 0 {
+    fail("Kernel Thread", "yielded Thread was not republished");
+  }
+
+  let redispatched = kernel_state::dispatch_current_hart_once()
+    .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  if redispatched != Some(thread.object)
+    || !kernel_thread::smoke_preempted()
+    || !kernel_thread::smoke_resumed()
+  {
+    fail("Kernel Thread", "preempted smoke Thread did not resume");
+  }
+  let (_, runnable, running) = kernel_state::global_scheduler_summary()
+    .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  if runnable != 0 || running != 0 {
+    fail("Kernel Thread", "smoke Thread did not park cleanly");
+  }
+  report::kernel_thread(thread.object, process.object, affinity);
+
+  kernel_state::wake_thread(user_thread.object)
+    .unwrap_or_else(|error| fail("User Scheduling", error.as_str()));
+  kernel_state::wake_thread(second_user_thread.object)
+    .unwrap_or_else(|error| fail("User Scheduling", error.as_str()));
+
+  let mut dispatches = [None; 16];
+  let mut dispatch_count = 0usize;
+  while dispatch_count < dispatches.len() {
+    let next = kernel_state::dispatch_current_hart_once()
+      .unwrap_or_else(|error| fail("User Scheduling", error.as_str()));
+    let Some(thread) = next else {
+      break;
+    };
+    dispatches[dispatch_count] = Some(thread);
+    dispatch_count += 1;
+    let summary = kernel_state::user_pair_summary(user_thread.object, second_user_thread.object)
+      .unwrap_or_else(|error| fail("User Scheduling", error.as_str()));
+    if summary.both_stopped() {
+      break;
+    }
+  }
+  let summary = kernel_state::user_pair_summary(user_thread.object, second_user_thread.object)
+    .unwrap_or_else(|error| fail("User Scheduling", error.as_str()));
+  if !summary.both_stopped()
+    || summary.total_yields != 6
+    || dispatch_count < 7
+    || dispatches[..6].windows(2).any(|pair| pair[0] == pair[1])
+  {
+    fail("User Scheduling", "user round-robin smoke did not converge");
+  }
+  report::user_scheduling(summary, dispatch_count);
+
+  let user_summary = kernel_state::user_dispatch_summary(user_thread.object, boot_index)
+    .unwrap_or_else(|error| fail("User Dispatch", error.as_str()));
+  if user_summary.state != crate::thread::ThreadState::Stopped
+    || user_summary.active_harts != 0
+    || user_summary.current_thread.is_some()
+  {
+    fail(
+      "User Dispatch",
+      "controlled user return left published state",
+    );
+  }
+  report::user_dispatch(user_summary);
+
+  let termination = kernel_state::termination_summary(process.object)
+    .unwrap_or_else(|error| fail("Process Termination", error.as_str()));
+  report::process_termination(termination);
+
+  report::scheduler_runtime();
   report::complete();
-  cpu::idle()
+  kernel_state::run_scheduler_loop()
 }
 
 pub fn run_secondary(hart_id: usize, hart_index: usize) -> ! {
@@ -97,8 +309,9 @@ pub fn run_secondary(hart_id: usize, hart_index: usize) -> ! {
   let _stvec = trap::install();
   ipi::enable_local();
   hart::install_kernel_address_space();
+  timer::initialize_local().unwrap_or_else(|_| cpu::halt());
   hart::complete_secondary(hart_id, hart_index).unwrap_or_else(|_| cpu::halt());
-  cpu::idle()
+  kernel_state::run_scheduler_loop()
 }
 
 fn load_dtb(dtb_address: usize) -> Dtb<'static> {

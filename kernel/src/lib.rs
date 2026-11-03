@@ -8,6 +8,7 @@ pub mod capability;
 pub mod capability_space;
 pub mod dtb;
 pub mod kernel_state;
+pub mod kernel_thread;
 pub mod memory;
 pub mod object;
 pub mod platform;
@@ -15,6 +16,7 @@ pub mod process;
 pub mod scheduler;
 pub mod sync;
 pub mod thread;
+pub mod user_image;
 
 #[cfg(target_arch = "riscv64")]
 pub mod boot;

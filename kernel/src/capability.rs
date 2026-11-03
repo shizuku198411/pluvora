@@ -309,7 +309,14 @@ pub const fn valid_rights(object_type: ObjectType) -> Rights {
       .union(Rights::GRANT)
       .union(Rights::REVOKE)
       .union(Rights::DESTROY),
-    ObjectType::Process | ObjectType::Thread => Rights::READ
+    ObjectType::Process => Rights::READ
+      .union(Rights::WRITE)
+      .union(Rights::TRANSFER)
+      .union(Rights::GRANT)
+      .union(Rights::REVOKE)
+      .union(Rights::CREATE)
+      .union(Rights::DESTROY),
+    ObjectType::Thread => Rights::READ
       .union(Rights::WRITE)
       .union(Rights::TRANSFER)
       .union(Rights::GRANT)
@@ -506,5 +513,19 @@ mod tests {
       assert!(valid_rights(object_type).contains(Rights::READ));
       assert!(valid_rights(object_type).contains(Rights::WRITE));
     }
+  }
+
+  #[test]
+  fn cap_015_only_process_capability_accepts_create_right() {
+    let mut space = CapabilitySpace::new();
+    assert!(
+      space
+        .insert_initial(OBJECT, ObjectType::Process, Rights::CREATE, node(1))
+        .is_ok()
+    );
+    assert_eq!(
+      space.insert_initial(OBJECT, ObjectType::Thread, Rights::CREATE, node(2)),
+      Err(Error::InvalidRights)
+    );
   }
 }

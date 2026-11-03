@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::arch::riscv64::paging::PagingInfo;
 use crate::arch::riscv64::sbi;
 use crate::memory::address_space::Asid;
+use crate::object::ObjectId;
 use crate::platform::{MAX_HARTS, PlatformInfo};
 
 #[cfg(target_arch = "riscv64")]
@@ -33,6 +34,10 @@ enum DepthError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
   InvalidHartIndex,
+  CurrentThreadBusy,
+  CurrentThreadMismatch,
+  PendingYieldBusy,
+  PendingYieldMismatch,
   InvalidStackLayout,
   InvalidSatp,
   HartIdMismatch,
@@ -45,6 +50,10 @@ impl Error {
   pub const fn as_str(self) -> &'static str {
     match self {
       Self::InvalidHartIndex => "invalid dense hart index",
+      Self::CurrentThreadBusy => "hart already has a current thread",
+      Self::CurrentThreadMismatch => "hart current thread identity does not match",
+      Self::PendingYieldBusy => "hart already has a pending yield",
+      Self::PendingYieldMismatch => "hart pending yield identity does not match",
       Self::InvalidStackLayout => "invalid secondary stack layout",
       Self::InvalidSatp => "satp value does not fit the target register",
       Self::HartIdMismatch => "secondary hart ID does not match boot descriptor",
@@ -67,6 +76,7 @@ pub struct HartLocal {
   dense_index: AtomicUsize,
   state: AtomicUsize,
   current_thread: AtomicUsize,
+  pending_yield: AtomicUsize,
   interrupt_disable_depth: AtomicUsize,
   restore_interrupts: AtomicBool,
   preemption_disable_depth: AtomicUsize,
@@ -83,6 +93,7 @@ impl HartLocal {
       dense_index: AtomicUsize::new(usize::MAX),
       state: AtomicUsize::new(HART_OFFLINE),
       current_thread: AtomicUsize::new(0),
+      pending_yield: AtomicUsize::new(0),
       interrupt_disable_depth: AtomicUsize::new(0),
       restore_interrupts: AtomicBool::new(false),
       preemption_disable_depth: AtomicUsize::new(0),
@@ -117,6 +128,17 @@ impl HartLocal {
     self.reschedule_pending.swap(false, Ordering::AcqRel)
   }
 
+  pub fn reschedule_requested(&self) -> bool {
+    self.reschedule_pending.load(Ordering::Acquire)
+  }
+
+  pub(crate) fn can_preempt(&self) -> bool {
+    self.interrupt_disable_depth.load(Ordering::Relaxed) == 0
+      && self.preemption_disable_depth.load(Ordering::Relaxed) == 0
+      && self.current_thread().is_some()
+      && self.pending_yield().is_none()
+  }
+
   fn enter_interrupt_disabled(&self, interrupts_were_enabled: bool) -> Result<(), DepthError> {
     let previous = increment_depth(&self.interrupt_disable_depth)?;
     if previous == 0 {
@@ -130,6 +152,11 @@ impl HartLocal {
   fn leave_interrupt_disabled(&self) -> Result<bool, DepthError> {
     let previous = decrement_depth(&self.interrupt_disable_depth)?;
     Ok(previous == 1 && self.restore_interrupts.swap(false, Ordering::Relaxed))
+  }
+
+  #[cfg(target_arch = "riscv64")]
+  fn interrupts_are_unmasked(&self) -> bool {
+    self.interrupt_disable_depth.load(Ordering::Relaxed) == 0
   }
 
   fn enter_preemption_disabled(&self) -> Result<(), DepthError> {
@@ -153,8 +180,52 @@ impl HartLocal {
       .store(usize::from(asid.value()), Ordering::Release);
   }
 
+  pub fn current_asid(&self) -> usize {
+    self.current_asid.load(Ordering::Acquire)
+  }
+
   pub fn has_ipi_requests(&self) -> bool {
     self.pending_ipi_requests.load(Ordering::Acquire) != 0
+  }
+
+  pub fn current_thread(&self) -> Option<ObjectId> {
+    ObjectId::from_raw(self.current_thread.load(Ordering::Acquire))
+  }
+
+  pub fn install_current_thread(&self, thread: ObjectId) -> Result<(), Error> {
+    self
+      .current_thread
+      .compare_exchange(0, thread.into_raw(), Ordering::AcqRel, Ordering::Acquire)
+      .map(|_| ())
+      .map_err(|_| Error::CurrentThreadBusy)
+  }
+
+  pub fn clear_current_thread(&self, expected: ObjectId) -> Result<(), Error> {
+    self
+      .current_thread
+      .compare_exchange(expected.into_raw(), 0, Ordering::AcqRel, Ordering::Acquire)
+      .map(|_| ())
+      .map_err(|_| Error::CurrentThreadMismatch)
+  }
+
+  pub(crate) fn pending_yield(&self) -> Option<ObjectId> {
+    ObjectId::from_raw(self.pending_yield.load(Ordering::Acquire))
+  }
+
+  pub(crate) fn install_pending_yield(&self, thread: ObjectId) -> Result<(), Error> {
+    self
+      .pending_yield
+      .compare_exchange(0, thread.into_raw(), Ordering::AcqRel, Ordering::Acquire)
+      .map(|_| ())
+      .map_err(|_| Error::PendingYieldBusy)
+  }
+
+  pub(crate) fn clear_pending_yield(&self, expected: ObjectId) -> Result<(), Error> {
+    self
+      .pending_yield
+      .compare_exchange(expected.into_raw(), 0, Ordering::AcqRel, Ordering::Acquire)
+      .map(|_| ())
+      .map_err(|_| Error::PendingYieldMismatch)
   }
 }
 
@@ -249,6 +320,60 @@ fn disable_local_interrupts() -> bool {
 fn enable_local_interrupts() {
   const SSTATUS_SIE: usize = 1 << 1;
   unsafe { asm!("csrs sstatus, {mask}", mask = in(reg) SSTATUS_SIE, options(nomem, nostack)) };
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) struct ThreadInterruptWindow {
+  restore_enabled: bool,
+}
+
+#[cfg(target_arch = "riscv64")]
+impl ThreadInterruptWindow {
+  pub(crate) fn mask_scheduler() -> Self {
+    let local = current();
+    assert!(
+      local.interrupts_are_unmasked(),
+      "cannot dispatch inside InterruptGuard"
+    );
+    let restore_enabled = disable_local_interrupts();
+    Self { restore_enabled }
+  }
+
+  pub(crate) fn returned_to_scheduler(&self) {
+    disable_local_interrupts();
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+impl Drop for ThreadInterruptWindow {
+  fn drop(&mut self) {
+    if self.restore_enabled {
+      enable_local_interrupts();
+    }
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn run_with_local_interrupts_enabled(action: impl FnOnce()) {
+  let local = current();
+  assert!(
+    local.interrupts_are_unmasked(),
+    "cannot enable interrupts inside InterruptGuard"
+  );
+  let was_enabled = local_interrupts_enabled();
+  enable_local_interrupts();
+  action();
+  if !was_enabled {
+    disable_local_interrupts();
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn local_interrupts_enabled() -> bool {
+  const SSTATUS_SIE: usize = 1 << 1;
+  let value: usize;
+  unsafe { asm!("csrr {value}, sstatus", value = out(reg) value, options(nomem, nostack)) };
+  value & SSTATUS_SIE != 0
 }
 
 #[repr(C)]
@@ -652,5 +777,72 @@ mod tests {
     local.request_reschedule();
     assert!(local.take_reschedule_request());
     assert!(!local.take_reschedule_request());
+  }
+
+  #[test]
+  fn ipi_008_reschedule_observation_does_not_consume_request() {
+    let local = HartLocal::empty();
+    assert!(!local.reschedule_requested());
+    local.request_reschedule();
+    assert!(local.reschedule_requested());
+    assert!(local.reschedule_requested());
+    assert!(local.take_reschedule_request());
+    assert!(!local.reschedule_requested());
+  }
+
+  #[test]
+  fn sched_030_current_thread_publication_preserves_identity() {
+    let local = HartLocal::empty();
+    let first = ObjectId::from_raw_parts(3, 1);
+    let replacement = ObjectId::from_raw_parts(3, 2);
+
+    assert_eq!(local.current_thread(), None);
+    assert_eq!(local.install_current_thread(first), Ok(()));
+    assert_eq!(local.current_thread(), Some(first));
+    assert_eq!(
+      local.install_current_thread(replacement),
+      Err(Error::CurrentThreadBusy)
+    );
+    assert_eq!(
+      local.clear_current_thread(replacement),
+      Err(Error::CurrentThreadMismatch)
+    );
+    assert_eq!(local.current_thread(), Some(first));
+    assert_eq!(local.clear_current_thread(first), Ok(()));
+    assert_eq!(local.current_thread(), None);
+  }
+
+  #[test]
+  fn sched_031_pending_yield_preserves_identity_until_expected_clear() {
+    let local = HartLocal::empty();
+    let thread = ObjectId::from_raw_parts(4, 7);
+    let other = ObjectId::from_raw_parts(5, 2);
+    assert_eq!(local.install_pending_yield(thread), Ok(()));
+    assert_eq!(local.pending_yield(), Some(thread));
+    assert_eq!(
+      local.install_pending_yield(other),
+      Err(Error::PendingYieldBusy)
+    );
+    assert_eq!(
+      local.clear_pending_yield(other),
+      Err(Error::PendingYieldMismatch)
+    );
+    assert_eq!(local.clear_pending_yield(thread), Ok(()));
+    assert_eq!(local.pending_yield(), None);
+  }
+
+  #[test]
+  fn sched_032_preemption_requires_unguarded_current_thread() {
+    let local = configured_local(0, 0, HART_ONLINE);
+    let thread = ObjectId::from_raw_parts(3, 1);
+    assert!(!local.can_preempt());
+
+    local.install_current_thread(thread).unwrap();
+    assert!(local.can_preempt());
+    local.enter_preemption_disabled().unwrap();
+    assert!(!local.can_preempt());
+    local.leave_preemption_disabled().unwrap();
+    local.enter_interrupt_disabled(true).unwrap();
+    assert!(!local.can_preempt());
   }
 }

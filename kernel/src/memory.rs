@@ -117,6 +117,42 @@ impl<'a> EarlyFrameAllocator<'a> {
 
     Ok(blocking_end)
   }
+
+  pub(super) fn memory_regions(&self) -> &[MemoryRegion] {
+    self.memory
+  }
+
+  pub(super) fn runtime_eligible(&self, frame_start: u64) -> Result<bool, Error> {
+    if !frame_start.is_multiple_of(PAGE_SIZE) {
+      return Err(Error::InvalidRange);
+    }
+    let Some(index) = self.memory.iter().position(|region| {
+      region
+        .end()
+        .is_some_and(|end| frame_start >= region.base && frame_start < end)
+    }) else {
+      return Ok(false);
+    };
+
+    if index < self.region_index {
+      return Ok(false);
+    }
+    if index == self.region_index {
+      let first = match self.next_candidate {
+        Some(candidate) => candidate,
+        None => align_up(self.memory[index].base, PAGE_SIZE)?,
+      };
+      if frame_start < first {
+        return Ok(false);
+      }
+    }
+
+    let frame = MemoryRegion {
+      base: frame_start,
+      size: PAGE_SIZE,
+    };
+    Ok(self.blocking_reservation_end(frame)?.is_none())
+  }
 }
 
 fn validate_region(region: MemoryRegion) -> Result<(), Error> {
@@ -249,3 +285,6 @@ mod tests {
 }
 
 pub mod address_space;
+pub mod frame_allocator;
+pub mod kernel_stack;
+pub mod user_page_table;

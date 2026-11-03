@@ -10,6 +10,7 @@ const _: () = {
   assert!(MAX_RUNNABLE_PER_HART > 0);
 };
 
+#[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
   AlreadyInitialized,
@@ -24,12 +25,21 @@ pub enum Error {
   ThreadNotQueued,
   CandidateChanged,
   InvalidPriority,
+  SuspendedBusy,
+  NoSuspendedThread,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WakeResult {
   pub target_hart: usize,
   pub request_reschedule: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DetachedLocation {
+  Queued { hart: usize },
+  Running { hart: usize },
+  Suspended { hart: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,14 +146,61 @@ pub struct SchedulerState {
   online_mask: u64,
   queues: [RunQueue; MAX_HARTS],
   running: [Option<Entry>; MAX_HARTS],
+  suspended: [Option<Entry>; MAX_HARTS],
 }
 
 impl SchedulerState {
+  #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+  pub(crate) fn location(&self, thread: ObjectId) -> Option<DetachedLocation> {
+    for hart in 0..MAX_HARTS {
+      if self.queues[hart].contains(thread) {
+        return Some(DetachedLocation::Queued { hart });
+      }
+      if self.running[hart].is_some_and(|entry| entry.thread == thread) {
+        return Some(DetachedLocation::Running { hart });
+      }
+      if self.suspended[hart].is_some_and(|entry| entry.thread == thread) {
+        return Some(DetachedLocation::Suspended { hart });
+      }
+    }
+    None
+  }
+
+  #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+  pub(crate) fn detach_for_termination(
+    &mut self,
+    thread: ObjectId,
+  ) -> Result<Option<DetachedLocation>, Error> {
+    let Some(location) = self.location(thread) else {
+      return Ok(None);
+    };
+    match location {
+      DetachedLocation::Queued { hart } => {
+        self.queues[hart].remove(thread)?;
+      }
+      DetachedLocation::Running { hart } => {
+        let entry = self.running[hart].take().ok_or(Error::NoRunningThread)?;
+        if entry.thread != thread {
+          return Err(Error::CandidateChanged);
+        }
+      }
+      DetachedLocation::Suspended { hart } => {
+        let entry = self.suspended[hart]
+          .take()
+          .ok_or(Error::NoSuspendedThread)?;
+        if entry.thread != thread {
+          return Err(Error::CandidateChanged);
+        }
+      }
+    }
+    Ok(Some(location))
+  }
   pub const fn uninitialized() -> Self {
     Self {
       online_mask: 0,
       queues: [RunQueue::new(); MAX_HARTS],
       running: [None; MAX_HARTS],
+      suspended: [None; MAX_HARTS],
     }
   }
 
@@ -250,6 +307,39 @@ impl SchedulerState {
       .ok_or(Error::NoRunningThread)
   }
 
+  pub(crate) fn suspend_running(&mut self, hart: usize, expected: ObjectId) -> Result<(), Error> {
+    self.require_online(hart)?;
+    if self.suspended[hart].is_some() {
+      return Err(Error::SuspendedBusy);
+    }
+    let running = self.running[hart].ok_or(Error::NoRunningThread)?;
+    if running.thread != expected {
+      return Err(Error::CandidateChanged);
+    }
+    self.running[hart] = None;
+    self.suspended[hart] = Some(running);
+    Ok(())
+  }
+
+  pub(crate) fn resume_suspended(
+    &mut self,
+    hart: usize,
+    thread: ObjectId,
+    priority: u8,
+  ) -> Result<(), Error> {
+    self.require_online(hart)?;
+    let reserved = self.suspended[hart].ok_or(Error::NoSuspendedThread)?;
+    if reserved.thread != thread || reserved.priority != priority {
+      return Err(Error::CandidateChanged);
+    }
+    if self.queues[hart].len() >= MAX_RUNNABLE_PER_HART {
+      return Err(Error::QueueFull);
+    }
+    self.queues[hart].push(reserved)?;
+    self.suspended[hart] = None;
+    Ok(())
+  }
+
   pub fn remove_queued(&mut self, thread: ObjectId) -> Result<(), Error> {
     for queue in &mut self.queues {
       if queue.contains(thread) {
@@ -278,11 +368,13 @@ impl SchedulerState {
       if allowed & (1u64 << hart) == 0 {
         continue;
       }
-      let len = self.queues[hart].len();
+      let len = self.reserved_len(hart)?;
       if len == MAX_RUNNABLE_PER_HART {
         continue;
       }
-      if selected.is_none_or(|current: usize| len < self.queues[current].len()) {
+      if selected.is_none_or(|current: usize| {
+        len < self.reserved_len(current).unwrap_or(MAX_RUNNABLE_PER_HART)
+      }) {
         selected = Some(hart);
       }
     }
@@ -292,10 +384,23 @@ impl SchedulerState {
   fn contains(&self, thread: ObjectId) -> bool {
     self.queues.iter().any(|queue| queue.contains(thread))
       || self
+        .suspended
+        .iter()
+        .flatten()
+        .any(|entry| entry.thread == thread)
+      || self
         .running
         .iter()
         .flatten()
         .any(|entry| entry.thread == thread)
+  }
+
+  fn reserved_len(&self, hart: usize) -> Result<usize, Error> {
+    self.require_online(hart)?;
+    self.queues[hart]
+      .len()
+      .checked_add(self.suspended[hart].is_some() as usize)
+      .ok_or(Error::QueueFull)
   }
 
   fn require_online(&self, hart: usize) -> Result<(), Error> {
@@ -421,5 +526,99 @@ mod tests {
     assert!(!lower.request_reschedule);
     let higher = scheduler.enqueue(thread(3), 1, 5).unwrap();
     assert!(higher.request_reschedule);
+  }
+
+  #[test]
+  fn sched_013_suspended_thread_is_in_no_execution_location() {
+    let mut scheduler = scheduler();
+    let thread = thread(1);
+    scheduler.enqueue(thread, 1, 8).unwrap();
+    scheduler.dispatch_expected(0, thread).unwrap();
+    scheduler.suspend_running(0, thread).unwrap();
+    assert_eq!(scheduler.total_running(), 0);
+    assert_eq!(scheduler.total_runnable(), 0);
+    assert_eq!(scheduler.running_thread(0), Ok(None));
+  }
+
+  #[test]
+  fn sched_014_suspended_thread_resumes_on_same_hart() {
+    let mut scheduler = scheduler();
+    let thread = thread(1);
+    scheduler.enqueue(thread, 1, 8).unwrap();
+    scheduler.dispatch_expected(0, thread).unwrap();
+    scheduler.suspend_running(0, thread).unwrap();
+    scheduler.resume_suspended(0, thread, 8).unwrap();
+    assert_eq!(scheduler.queue_len(0), Ok(1));
+    assert_eq!(scheduler.peek_next(0), Ok(Some(thread)));
+  }
+
+  #[test]
+  fn sched_015_suspended_thread_reserves_one_queue_slot() {
+    let mut scheduler = scheduler();
+    let suspended = thread(0);
+    scheduler.enqueue(suspended, 1, 8).unwrap();
+    scheduler.dispatch_expected(0, suspended).unwrap();
+    scheduler.suspend_running(0, suspended).unwrap();
+
+    for slot in 1..MAX_RUNNABLE_PER_HART as u16 {
+      scheduler.enqueue(thread(slot), 1, 8).unwrap();
+    }
+    assert_eq!(scheduler.queue_len(0), Ok(MAX_RUNNABLE_PER_HART - 1));
+    assert_eq!(scheduler.enqueue(thread(200), 1, 8), Err(Error::QueueFull));
+    scheduler.resume_suspended(0, suspended, 8).unwrap();
+    assert_eq!(scheduler.queue_len(0), Ok(MAX_RUNNABLE_PER_HART));
+  }
+
+  #[test]
+  fn sched_016_suspended_reservation_rejects_duplicate_and_wrong_identity() {
+    let mut scheduler = scheduler();
+    let suspended = thread(1);
+    scheduler.enqueue(suspended, 1, 8).unwrap();
+    scheduler.dispatch_expected(0, suspended).unwrap();
+    scheduler.suspend_running(0, suspended).unwrap();
+    assert_eq!(
+      scheduler.enqueue(suspended, 1, 8),
+      Err(Error::DuplicateThread)
+    );
+    assert_eq!(
+      scheduler.resume_suspended(0, thread(2), 8),
+      Err(Error::CandidateChanged)
+    );
+    assert_eq!(
+      scheduler.resume_suspended(0, suspended, 9),
+      Err(Error::CandidateChanged)
+    );
+    scheduler.resume_suspended(0, suspended, 8).unwrap();
+    assert_eq!(
+      scheduler.resume_suspended(0, suspended, 8),
+      Err(Error::NoSuspendedThread)
+    );
+  }
+
+  #[test]
+  fn sched_017_termination_detaches_each_execution_location() {
+    let mut scheduler = scheduler();
+    let queued = thread(1);
+    let running = thread(2);
+    let suspended = thread(3);
+    scheduler.enqueue(queued, 1, 1).unwrap();
+    assert_eq!(
+      scheduler.detach_for_termination(queued),
+      Ok(Some(DetachedLocation::Queued { hart: 0 }))
+    );
+    scheduler.enqueue(running, 1, 2).unwrap();
+    scheduler.dispatch_expected(0, running).unwrap();
+    assert_eq!(
+      scheduler.detach_for_termination(running),
+      Ok(Some(DetachedLocation::Running { hart: 0 }))
+    );
+    scheduler.enqueue(suspended, 1, 3).unwrap();
+    scheduler.dispatch_expected(0, suspended).unwrap();
+    scheduler.suspend_running(0, suspended).unwrap();
+    assert_eq!(
+      scheduler.detach_for_termination(suspended),
+      Ok(Some(DetachedLocation::Suspended { hart: 0 }))
+    );
+    assert_eq!(scheduler.detach_for_termination(suspended), Ok(None));
   }
 }

@@ -1,6 +1,6 @@
 use core::arch::asm;
 
-use crate::arch::riscv64::{hart, ipi};
+use crate::arch::riscv64::hart;
 
 pub fn halt() -> ! {
   loop {
@@ -9,14 +9,12 @@ pub fn halt() -> ! {
   }
 }
 
-pub fn idle() -> ! {
-  loop {
-    if hart::current().has_ipi_requests() {
-      ipi::handle_local();
-      continue;
+pub fn wait_for_interrupt() {
+  hart::run_with_local_interrupts_enabled(|| {
+    let local = hart::current();
+    if !local.reschedule_requested() && !local.has_ipi_requests() {
+      // WFI may return spuriously. The scheduler loop always rechecks state.
+      unsafe { asm!("wfi", options(nomem, nostack)) };
     }
-    // SSIE is enabled. A pending supervisor software interrupt wakes WFI
-    // even while sstatus.SIE remains clear; the loop then polls the mailbox.
-    unsafe { asm!("wfi", options(nomem, nostack)) };
-  }
+  });
 }

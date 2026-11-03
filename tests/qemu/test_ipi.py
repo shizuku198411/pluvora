@@ -13,6 +13,11 @@ class IpiFoundationTests(QemuTestCase):
     def test_ipi_q002_trap_setup_reaches_boot_completion_without_fatal_trap(self) -> None:
         self.assertIn("[S-mode traps]", self.output)
         self.assertNotIn("[Fatal S-mode Trap]", self.output)
+
+    def test_ipi_q003_scheduler_uses_reschedule_ipi(self) -> None:
+        self.assertIn("Wake notification : reschedule IPI", self.output)
+        self.assertNotIn("[Fatal S-mode Trap]", self.output)
+        self.assertNotIn("[PANIC]", self.output)
         self.assertLess(
             self.output.index("[S-mode traps]"),
             self.output.index(SUCCESS_MARKER),

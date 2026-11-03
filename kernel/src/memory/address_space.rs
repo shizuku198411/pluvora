@@ -1,11 +1,17 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::arch::riscv64::paging::UserPermissions;
+use crate::memory::user_page_table::UserPageTable;
+#[cfg(target_arch = "riscv64")]
+use crate::memory::user_page_table::{MappingFailure, MappingSuccess, PreparedMappingFrames};
+use crate::object::ObjectId;
 use crate::platform::MAX_HARTS;
 #[cfg(target_arch = "riscv64")]
 use crate::{arch::riscv64::tlb, sync::SpinLock};
 
 const KERNEL_ASID: u16 = 0;
 const KERNEL_GENERATION: u64 = 0;
+pub const MAX_USER_MAPPINGS: usize = 2;
 
 const _: () = assert!(MAX_HARTS <= u64::BITS as usize);
 
@@ -16,6 +22,22 @@ static ASID_ALLOCATOR: SpinLock<Option<AsidState>> = SpinLock::new(None);
 pub struct Asid {
   value: u16,
   generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchToken {
+  satp: u64,
+  asid: Asid,
+}
+
+impl DispatchToken {
+  pub const fn satp(self) -> u64 {
+    self.satp
+  }
+
+  pub const fn asid(self) -> Asid {
+    self.asid
+  }
 }
 
 impl Asid {
@@ -66,11 +88,39 @@ impl AllocatorError {
   }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MappingRecord {
+  memory: ObjectId,
+  virtual_address: u64,
+  permissions: UserPermissions,
+}
+
+impl MappingRecord {
+  pub const fn memory(&self) -> ObjectId {
+    self.memory
+  }
+
+  pub const fn virtual_address(&self) -> u64 {
+    self.virtual_address
+  }
+
+  pub const fn permissions(&self) -> UserPermissions {
+    self.permissions
+  }
+}
+
+enum AddressSpaceKind {
+  Kernel { root_frame: u64 },
+  User { table: UserPageTable },
+}
+
 pub struct AddressSpace {
-  root_frame: u64,
+  kind: AddressSpaceKind,
   asid: Asid,
   active_harts: AtomicU64,
   resident_harts: AtomicU64,
+  mappings: [Option<MappingRecord>; MAX_USER_MAPPINGS],
+  mapping_len: usize,
 }
 
 impl AddressSpace {
@@ -79,19 +129,122 @@ impl AddressSpace {
       return Err(Error::InvalidRootFrame);
     }
     Ok(Self {
-      root_frame,
+      kind: AddressSpaceKind::Kernel { root_frame },
       asid,
       active_harts: AtomicU64::new(0),
       resident_harts: AtomicU64::new(0),
+      mappings: [const { None }; MAX_USER_MAPPINGS],
+      mapping_len: 0,
+    })
+  }
+
+  pub fn new_user(table: UserPageTable, asid: Asid) -> Result<Self, Error> {
+    let root_frame = table.root_frame();
+    if root_frame == 0 || !root_frame.is_multiple_of(4096) {
+      return Err(Error::InvalidRootFrame);
+    }
+    Ok(Self {
+      kind: AddressSpaceKind::User { table },
+      asid,
+      active_harts: AtomicU64::new(0),
+      resident_harts: AtomicU64::new(0),
+      mappings: [const { None }; MAX_USER_MAPPINGS],
+      mapping_len: 0,
     })
   }
 
   pub const fn root_frame(&self) -> u64 {
-    self.root_frame
+    match &self.kind {
+      AddressSpaceKind::Kernel { root_frame } => *root_frame,
+      AddressSpaceKind::User { table } => table.root_frame(),
+    }
   }
 
   pub const fn asid(&self) -> Asid {
     self.asid
+  }
+
+  pub fn dispatch_token(&self) -> Result<DispatchToken, crate::arch::riscv64::paging::Error> {
+    Ok(DispatchToken {
+      satp: crate::arch::riscv64::paging::satp_value_for(self.root_frame(), self.asid.value())?,
+      asid: self.asid,
+    })
+  }
+
+  pub const fn is_user(&self) -> bool {
+    matches!(self.kind, AddressSpaceKind::User { .. })
+  }
+
+  pub const fn mapping_count(&self) -> usize {
+    self.mapping_len
+  }
+
+  pub fn mapping(&self, index: usize) -> Option<&MappingRecord> {
+    self.mappings.get(index).and_then(Option::as_ref)
+  }
+
+  pub fn has_initial_user_image(&self) -> bool {
+    if !self.is_user() {
+      return false;
+    }
+    let mut text = false;
+    let mut stack = false;
+    for mapping in self.mappings[..self.mapping_len].iter().flatten() {
+      match (mapping.virtual_address(), mapping.permissions()) {
+        (crate::memory::user_page_table::USER_TEXT_BASE, UserPermissions::ReadExecute) => {
+          text = true
+        }
+        (crate::memory::user_page_table::USER_STACK_BASE, UserPermissions::ReadWrite) => {
+          stack = true
+        }
+        _ => {}
+      }
+    }
+    text && stack
+  }
+
+  #[cfg(target_arch = "riscv64")]
+  pub fn map_user_page(
+    &mut self,
+    memory: ObjectId,
+    physical_address: u64,
+    virtual_address: u64,
+    permissions: UserPermissions,
+    frames: PreparedMappingFrames,
+  ) -> Result<MappingSuccess, MappingFailure> {
+    if self.mapping_len == MAX_USER_MAPPINGS {
+      return Err(MappingFailure::new(
+        crate::memory::user_page_table::Error::MappingLimit,
+        frames,
+      ));
+    }
+    if self.mappings[..self.mapping_len]
+      .iter()
+      .flatten()
+      .any(|mapping| mapping.virtual_address() == virtual_address)
+    {
+      return Err(MappingFailure::new(
+        crate::memory::user_page_table::Error::AlreadyMapped,
+        frames,
+      ));
+    }
+    let table = match &mut self.kind {
+      AddressSpaceKind::User { table } => table,
+      AddressSpaceKind::Kernel { .. } => {
+        return Err(MappingFailure::new(
+          crate::memory::user_page_table::Error::KernelAddressSpace,
+          frames,
+        ));
+      }
+    };
+    let success = table.map_user_page(virtual_address, physical_address, permissions, frames)?;
+    self.mappings[self.mapping_len] = Some(MappingRecord {
+      memory,
+      virtual_address,
+      permissions,
+    });
+    self.mapping_len += 1;
+    Ok(success)
   }
 
   pub fn enter_hart(&self, index: usize) -> Result<(), Error> {
@@ -262,5 +415,42 @@ mod tests {
   fn aspace_004_invalid_hart_index_is_rejected() {
     let space = AddressSpace::new(0x8020_0000, Asid::kernel()).unwrap();
     assert_eq!(space.enter_hart(MAX_HARTS), Err(Error::InvalidHartIndex));
+  }
+
+  #[test]
+  fn aspace_005_kernel_space_is_not_a_user_mapping_target() {
+    let space = AddressSpace::new(0x8020_0000, Asid::kernel()).unwrap();
+    assert!(!space.is_user());
+    assert_eq!(space.mapping_count(), 0);
+    assert!(space.mapping(0).is_none());
+  }
+
+  #[test]
+  fn aspace_006_initial_user_image_capacity_is_two_mappings() {
+    assert_eq!(MAX_USER_MAPPINGS, 2);
+  }
+
+  #[test]
+  fn aspace_007_dispatch_token_encodes_root_and_asid() {
+    let mut state = AsidState::new(2);
+    let asid = state.allocate_without_rollover().unwrap();
+    let space = AddressSpace::new(0x8020_0000, asid).unwrap();
+    let token = space.dispatch_token().unwrap();
+    assert_eq!(token.asid(), asid);
+    assert_eq!(
+      token.satp(),
+      crate::arch::riscv64::paging::satp_value_for(0x8020_0000, 1).unwrap()
+    );
+  }
+
+  #[test]
+  fn aspace_008_kernel_dispatch_token_uses_asid_zero() {
+    let space = AddressSpace::new(0x8020_0000, Asid::kernel()).unwrap();
+    let token = space.dispatch_token().unwrap();
+    assert_eq!(token.asid(), Asid::kernel());
+    assert_eq!(
+      token.satp(),
+      crate::arch::riscv64::paging::satp_value_for(0x8020_0000, 0).unwrap()
+    );
   }
 }

@@ -5,17 +5,18 @@ use core::ptr;
 use core::arch::asm;
 
 use crate::memory::{EarlyFrameAllocator, Error as MemoryError, PAGE_SIZE};
-use crate::platform::MemoryRegion;
+use crate::platform::{MemoryRegion, PlatformInfo};
 
-const ENTRIES_PER_TABLE: usize = 512;
+pub(crate) const ENTRIES_PER_TABLE: usize = 512;
 const VPN_MASK: u64 = 0x1ff;
 const PTE_PPN_SHIFT: u64 = 10;
 const PAGE_SHIFT: u64 = 12;
 
-const PTE_VALID: u64 = 1 << 0;
+pub(crate) const PTE_VALID: u64 = 1 << 0;
 const PTE_READ: u64 = 1 << 1;
 const PTE_WRITE: u64 = 1 << 2;
 const PTE_EXECUTE: u64 = 1 << 3;
+pub(crate) const PTE_USER: u64 = 1 << 4;
 const PTE_ACCESSED: u64 = 1 << 6;
 const PTE_DIRTY: u64 = 1 << 7;
 
@@ -23,7 +24,7 @@ const SATP_MODE_SV39: u64 = 8;
 const SATP_MODE_SHIFT: u64 = 60;
 const SATP_ASID_SHIFT: u64 = 44;
 const SATP_ASID_MASK: u64 = 0xffff;
-const SATP_PPN_MASK: u64 = (1 << 44) - 1;
+pub(crate) const SATP_PPN_MASK: u64 = (1 << 44) - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -78,6 +79,34 @@ impl Permissions {
   }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserPermissions {
+  ReadOnly,
+  ReadWrite,
+  ReadExecute,
+}
+
+impl UserPermissions {
+  pub const fn required_rights(self) -> crate::capability::Rights {
+    match self {
+      Self::ReadOnly => crate::capability::Rights::READ,
+      Self::ReadWrite => crate::capability::Rights::READ.union(crate::capability::Rights::WRITE),
+      Self::ReadExecute => {
+        crate::capability::Rights::READ.union(crate::capability::Rights::EXECUTE)
+      }
+    }
+  }
+
+  pub(crate) const fn pte_flags(self) -> u64 {
+    let access = match self {
+      Self::ReadOnly => PTE_READ | PTE_ACCESSED,
+      Self::ReadWrite => PTE_READ | PTE_WRITE | PTE_ACCESSED | PTE_DIRTY,
+      Self::ReadExecute => PTE_READ | PTE_EXECUTE | PTE_ACCESSED,
+    };
+    access | PTE_USER
+  }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct KernelLayout {
   pub text: MemoryRegion,
@@ -113,7 +142,9 @@ impl PagingInfo {
 
 pub fn build(
   allocator: &mut EarlyFrameAllocator<'_>,
+  platform: &PlatformInfo,
   layout: KernelLayout,
+  kernel: MemoryRegion,
   dtb: MemoryRegion,
 ) -> Result<PagingInfo, Error> {
   let mut mapper = Mapper::new(allocator)?;
@@ -125,6 +156,7 @@ pub fn build(
   }
   mapper.map_identity(layout.bss, Permissions::ReadWrite)?;
   mapper.map_identity(dtb, Permissions::ReadOnly)?;
+  mapper.map_usable_ram(platform, kernel, dtb)?;
 
   Ok(PagingInfo {
     root_frame: mapper.root_frame,
@@ -200,6 +232,37 @@ impl<'allocator, 'memory> Mapper<'allocator, 'memory> {
     Ok(())
   }
 
+  fn map_usable_ram(
+    &mut self,
+    platform: &PlatformInfo,
+    kernel: MemoryRegion,
+    dtb: MemoryRegion,
+  ) -> Result<(), Error> {
+    for memory in platform.memory_regions() {
+      let end = align_down(memory.end().ok_or(Error::InvalidRegion)?);
+      let mut address = align_up(memory.base)?;
+      while address < end {
+        let page = MemoryRegion {
+          base: address,
+          size: PAGE_SIZE,
+        };
+        let reserved = platform
+          .reserved_regions()
+          .iter()
+          .copied()
+          .chain([kernel, dtb])
+          .try_fold(false, |found, region| {
+            Ok::<bool, Error>(found || regions_overlap(page, region)?)
+          })?;
+        if !reserved {
+          self.map_page(address, address, Permissions::ReadWrite)?;
+        }
+        address = address.checked_add(PAGE_SIZE).ok_or(Error::InvalidRegion)?;
+      }
+    }
+    Ok(())
+  }
+
   fn map_page(
     &mut self,
     virtual_address: u64,
@@ -209,7 +272,7 @@ impl<'allocator, 'memory> Mapper<'allocator, 'memory> {
     if !virtual_address.is_multiple_of(PAGE_SIZE) || !physical_address.is_multiple_of(PAGE_SIZE) {
       return Err(Error::InvalidRegion);
     }
-    if !is_sv39_canonical(virtual_address) {
+    if !is_sv39_address(virtual_address) {
       return Err(Error::InvalidVirtualAddress);
     }
     if physical_address >> PAGE_SHIFT > SATP_PPN_MASK {
@@ -248,6 +311,12 @@ impl<'allocator, 'memory> Mapper<'allocator, 'memory> {
   }
 }
 
+fn regions_overlap(left: MemoryRegion, right: MemoryRegion) -> Result<bool, Error> {
+  let left_end = left.end().ok_or(Error::InvalidRegion)?;
+  let right_end = right.end().ok_or(Error::InvalidRegion)?;
+  Ok(left.base < right_end && right.base < left_end)
+}
+
 fn allocate_table_frame(allocator: &mut EarlyFrameAllocator<'_>) -> Result<u64, Error> {
   allocator
     .allocate_zeroed()?
@@ -255,15 +324,15 @@ fn allocate_table_frame(allocator: &mut EarlyFrameAllocator<'_>) -> Result<u64, 
     .ok_or(Error::OutOfMemory)
 }
 
-fn table_pointer(physical_address: u64) -> u64 {
+pub(crate) fn table_pointer(physical_address: u64) -> u64 {
   ((physical_address >> PAGE_SHIFT) << PTE_PPN_SHIFT) | PTE_VALID
 }
 
-fn pte_physical_address(entry: u64) -> u64 {
+pub(crate) fn pte_physical_address(entry: u64) -> u64 {
   ((entry >> PTE_PPN_SHIFT) & SATP_PPN_MASK) << PAGE_SHIFT
 }
 
-fn is_leaf(entry: u64) -> bool {
+pub(crate) fn is_leaf(entry: u64) -> bool {
   entry & (PTE_READ | PTE_WRITE | PTE_EXECUTE) != 0
 }
 
@@ -282,7 +351,7 @@ fn write_entry(table_frame: u64, index: usize, value: u64) -> Result<(), Error> 
   Ok(())
 }
 
-fn entry_address(table_frame: u64, index: usize) -> Result<usize, Error> {
+pub(crate) fn entry_address(table_frame: u64, index: usize) -> Result<usize, Error> {
   if index >= ENTRIES_PER_TABLE || !table_frame.is_multiple_of(PAGE_SIZE) {
     return Err(Error::InvalidPhysicalAddress);
   }
@@ -295,7 +364,7 @@ fn entry_address(table_frame: u64, index: usize) -> Result<usize, Error> {
   usize::try_from(address).map_err(|_| Error::InvalidPhysicalAddress)
 }
 
-fn vpn_indices(virtual_address: u64) -> [usize; 3] {
+pub(crate) fn vpn_indices(virtual_address: u64) -> [usize; 3] {
   [
     ((virtual_address >> 12) & VPN_MASK) as usize,
     ((virtual_address >> 21) & VPN_MASK) as usize,
@@ -303,7 +372,7 @@ fn vpn_indices(virtual_address: u64) -> [usize; 3] {
   ]
 }
 
-fn is_sv39_canonical(address: u64) -> bool {
+pub const fn is_sv39_address(address: u64) -> bool {
   let sign = (address >> 38) & 1;
   let upper = address >> 39;
   upper == if sign == 0 { 0 } else { (1 << 25) - 1 }
@@ -331,8 +400,23 @@ pub fn satp_value_for(root_frame: u64, asid: u16) -> Result<u64, Error> {
   Ok((SATP_MODE_SV39 << SATP_MODE_SHIFT) | (u64::from(asid) << SATP_ASID_SHIFT) | root_ppn)
 }
 
+#[cfg(target_arch = "riscv64")]
+pub(crate) unsafe fn activate_dispatch_token(token: crate::memory::address_space::DispatchToken) {
+  let satp = token.satp();
+  // SAFETY: caller validated the transition, owns the current hart with
+  // interrupts masked, and both roots contain the executing kernel mapping.
+  unsafe {
+    asm!(
+      "csrw satp, {satp}",
+      "sfence.vma zero, zero",
+      satp = in(reg) satp,
+      options(nostack),
+    )
+  };
+}
+
 pub fn is_valid_page_address(virtual_address: u64) -> bool {
-  virtual_address.is_multiple_of(PAGE_SIZE) && is_sv39_canonical(virtual_address)
+  virtual_address.is_multiple_of(PAGE_SIZE) && is_sv39_address(virtual_address)
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -389,18 +473,18 @@ mod tests {
 
   #[test]
   fn vm_001_lower_sv39_address_is_canonical() {
-    assert!(is_sv39_canonical(0x0000_003f_ffff_ffff));
+    assert!(is_sv39_address(0x0000_003f_ffff_ffff));
   }
 
   #[test]
   fn vm_002_upper_sv39_address_is_canonical() {
-    assert!(is_sv39_canonical(0xffff_ffc0_0000_0000));
+    assert!(is_sv39_address(0xffff_ffc0_0000_0000));
   }
 
   #[test]
   fn vm_003_invalid_sign_extension_is_rejected() {
-    assert!(!is_sv39_canonical(0x0000_0040_0000_0000));
-    assert!(!is_sv39_canonical(0xffff_ffbf_ffff_ffff));
+    assert!(!is_sv39_address(0x0000_0040_0000_0000));
+    assert!(!is_sv39_address(0xffff_ffbf_ffff_ffff));
   }
 
   #[test]
@@ -438,6 +522,21 @@ mod tests {
   }
 
   #[test]
+  fn vm_010_user_permissions_require_matching_capability_rights() {
+    use crate::capability::Rights;
+
+    assert_eq!(UserPermissions::ReadOnly.required_rights(), Rights::READ);
+    assert_eq!(
+      UserPermissions::ReadWrite.required_rights(),
+      Rights::READ.union(Rights::WRITE)
+    );
+    assert_eq!(
+      UserPermissions::ReadExecute.required_rights(),
+      Rights::READ.union(Rights::EXECUTE)
+    );
+  }
+
+  #[test]
   fn vm_015_alignment_covers_partial_pages() {
     assert_eq!(align_down(0x1234), 0x1000);
     assert_eq!(align_up(0x1234), Ok(0x2000));
@@ -468,6 +567,34 @@ mod tests {
     assert_eq!(
       satp_value_for(0x8020_0000, 0x1234),
       Ok((SATP_MODE_SV39 << SATP_MODE_SHIFT) | (0x1234 << SATP_ASID_SHIFT) | 0x80200)
+    );
+  }
+
+  #[test]
+  fn vm_023_runtime_mapping_overlap_uses_half_open_ranges() {
+    let page = MemoryRegion {
+      base: 0x4000,
+      size: PAGE_SIZE,
+    };
+    assert_eq!(
+      regions_overlap(
+        page,
+        MemoryRegion {
+          base: 0x4fff,
+          size: 2,
+        }
+      ),
+      Ok(true)
+    );
+    assert_eq!(
+      regions_overlap(
+        page,
+        MemoryRegion {
+          base: 0x5000,
+          size: PAGE_SIZE,
+        }
+      ),
+      Ok(false)
     );
   }
 }

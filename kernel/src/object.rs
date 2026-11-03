@@ -1,4 +1,4 @@
-use crate::memory::{PAGE_SIZE, address_space::AddressSpace};
+use crate::memory::{PAGE_SIZE, address_space::AddressSpace, frame_allocator};
 use crate::process::Process;
 use crate::thread::Thread;
 
@@ -10,6 +10,8 @@ pub enum Error {
   InvalidObject,
   WrongObjectType,
   InvalidMemoryFrame,
+  InvalidUserImage,
+  UserImageAlreadyInitialized,
   DuplicateObject,
   ReferenceOverflow,
   ReferenceUnderflow,
@@ -42,23 +44,107 @@ impl ObjectId {
   pub(crate) const fn generation(self) -> u32 {
     self.generation
   }
+
+  pub(crate) const fn into_raw(self) -> usize {
+    ((self.generation as usize) << 16) | self.slot as usize
+  }
+
+  pub(crate) const fn from_raw(raw: usize) -> Option<Self> {
+    let slot = raw & 0xffff;
+    let generation = raw >> 16;
+    if slot >= MAX_OBJECTS || generation == 0 || generation > u32::MAX as usize {
+      return None;
+    }
+    Some(Self {
+      slot: slot as u16,
+      generation: generation as u32,
+    })
+  }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryContent {
+  Zeroed,
+  UserImageReady { bytes: usize },
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub struct MemoryObject {
-  frame_start: u64,
+  frame: frame_allocator::FrameBlock,
+  content: MemoryContent,
 }
 
 impl MemoryObject {
-  pub fn new(frame_start: u64) -> Result<Self, Error> {
-    if frame_start == 0 || !frame_start.is_multiple_of(PAGE_SIZE) {
+  pub fn new(frame: frame_allocator::FrameBlock) -> Result<Self, Error> {
+    if frame.start() == 0 || !frame.start().is_multiple_of(PAGE_SIZE) || frame.frames() != 1 {
       return Err(Error::InvalidMemoryFrame);
     }
-    Ok(Self { frame_start })
+    Ok(Self {
+      frame,
+      content: MemoryContent::Zeroed,
+    })
   }
 
-  pub fn frame_start(self) -> u64 {
-    self.frame_start
+  pub const fn frame_start(&self) -> u64 {
+    self.frame.start()
+  }
+
+  pub const fn user_image_bytes(&self) -> Option<usize> {
+    match self.content {
+      MemoryContent::Zeroed => None,
+      MemoryContent::UserImageReady { bytes } => Some(bytes),
+    }
+  }
+
+  pub const fn is_user_image_ready(&self) -> bool {
+    self.user_image_bytes().is_some()
+  }
+
+  fn validate_user_image(&self, image: &[u8]) -> Result<(), Error> {
+    if !matches!(self.content, MemoryContent::Zeroed) {
+      return Err(Error::UserImageAlreadyInitialized);
+    }
+    if image.is_empty() || image.len() > PAGE_SIZE as usize || !image.len().is_multiple_of(4) {
+      return Err(Error::InvalidUserImage);
+    }
+    Ok(())
+  }
+
+  #[cfg(target_arch = "riscv64")]
+  pub(crate) fn initialize_user_image(&mut self, image: &'static [u8]) -> Result<(), Error> {
+    use core::ptr;
+
+    self.validate_user_image(image)?;
+    let destination = usize::try_from(self.frame.start()).map_err(|_| Error::InvalidMemoryFrame)?;
+    // SAFETY: MemoryObject exclusively owns one live identity-mapped page. The
+    // caller verified that no mapping references exist. image is trusted,
+    // page-bounded kernel data and the source and destination do not overlap.
+    unsafe {
+      ptr::copy_nonoverlapping(image.as_ptr(), destination as *mut u8, image.len());
+      ptr::write_bytes(
+        (destination as *mut u8).add(image.len()),
+        0,
+        PAGE_SIZE as usize - image.len(),
+      );
+    }
+    crate::user_image::synchronize_local_instruction_stream();
+    self.content = MemoryContent::UserImageReady { bytes: image.len() };
+    Ok(())
+  }
+
+  #[cfg(test)]
+  pub(crate) fn mark_user_image_for_test(&mut self, image_bytes: usize) -> Result<(), Error> {
+    let validation_image = [0u8; 4];
+    if image_bytes == 0 || image_bytes > PAGE_SIZE as usize || !image_bytes.is_multiple_of(4) {
+      return Err(Error::InvalidUserImage);
+    }
+    self.validate_user_image(&validation_image)?;
+    self.content = MemoryContent::UserImageReady { bytes: image_bytes };
+    Ok(())
+  }
+
+  pub fn into_frame(self) -> frame_allocator::FrameBlock {
+    self.frame
   }
 }
 
@@ -86,10 +172,24 @@ impl KernelObject {
     }
   }
 
+  pub fn as_memory_mut(&mut self) -> Option<&mut MemoryObject> {
+    match self {
+      Self::Memory(memory) => Some(memory),
+      Self::AddressSpace(_) | Self::Process(_) | Self::Thread(_) => None,
+    }
+  }
+
   pub const fn as_address_space(&self) -> Option<&AddressSpace> {
     match self {
       Self::Memory(_) | Self::Process(_) | Self::Thread(_) => None,
       Self::AddressSpace(space) => Some(space),
+    }
+  }
+
+  pub fn as_address_space_mut(&mut self) -> Option<&mut AddressSpace> {
+    match self {
+      Self::AddressSpace(space) => Some(space),
+      Self::Memory(_) | Self::Process(_) | Self::Thread(_) => None,
     }
   }
 
@@ -123,7 +223,7 @@ impl KernelObject {
 
   fn has_same_identity(&self, other: &Self) -> bool {
     match (self, other) {
-      (Self::Memory(left), Self::Memory(right)) => left == right,
+      (Self::Memory(left), Self::Memory(right)) => left.frame_start() == right.frame_start(),
       (Self::AddressSpace(left), Self::AddressSpace(right)) => {
         left.root_frame() == right.root_frame() && left.asid() == right.asid()
       }
@@ -136,6 +236,8 @@ pub struct ObjectSlot {
   generation: u32,
   object: Option<KernelObject>,
   capability_references: usize,
+  mapping_references: usize,
+  attachment_references: usize,
 }
 
 impl ObjectSlot {
@@ -144,6 +246,8 @@ impl ObjectSlot {
       generation: 1,
       object: None,
       capability_references: 0,
+      mapping_references: 0,
+      attachment_references: 0,
     }
   }
 }
@@ -154,6 +258,27 @@ pub struct ObjectTable {
 }
 
 impl ObjectTable {
+  #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+  pub(crate) fn thread_ids_for_process(
+    &self,
+    process: ObjectId,
+  ) -> [Option<ObjectId>; MAX_OBJECTS] {
+    let mut result = [None; MAX_OBJECTS];
+    let mut len = 0usize;
+    for (index, slot) in self.slots.iter().enumerate() {
+      let Some(KernelObject::Thread(thread)) = slot.object.as_ref() else {
+        continue;
+      };
+      if thread.process() == process {
+        result[len] = Some(ObjectId {
+          slot: index as u16,
+          generation: slot.generation,
+        });
+        len += 1;
+      }
+    }
+    result
+  }
   pub const fn new() -> Self {
     Self {
       slots: [const { ObjectSlot::empty() }; MAX_OBJECTS],
@@ -179,6 +304,8 @@ impl ObjectTable {
       .ok_or(Error::TableFull)?;
 
     debug_assert_eq!(slot.capability_references, 0);
+    debug_assert_eq!(slot.mapping_references, 0);
+    debug_assert_eq!(slot.attachment_references, 0);
     slot.object = Some(object);
     self.live = self.live.checked_add(1).ok_or(Error::ReferenceOverflow)?;
 
@@ -234,9 +361,68 @@ impl ObjectTable {
     Ok(())
   }
 
+  pub(crate) fn can_add_mapping_reference(&self, id: ObjectId) -> Result<(), Error> {
+    self
+      .mapping_references(id)?
+      .checked_add(1)
+      .map(|_| ())
+      .ok_or(Error::ReferenceOverflow)
+  }
+
+  pub(crate) fn add_mapping_reference(&mut self, id: ObjectId) -> Result<(), Error> {
+    let slot = self.slot_mut(id)?;
+    slot.mapping_references = slot
+      .mapping_references
+      .checked_add(1)
+      .ok_or(Error::ReferenceOverflow)?;
+    Ok(())
+  }
+
+  #[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "unmap will release mapping references")
+  )]
+  pub(crate) fn remove_mapping_reference(&mut self, id: ObjectId) -> Result<(), Error> {
+    let slot = self.slot_mut(id)?;
+    slot.mapping_references = slot
+      .mapping_references
+      .checked_sub(1)
+      .ok_or(Error::ReferenceUnderflow)?;
+    Ok(())
+  }
+
+  pub(crate) fn can_add_attachment_reference(&self, id: ObjectId) -> Result<(), Error> {
+    self
+      .attachment_references(id)?
+      .checked_add(1)
+      .map(|_| ())
+      .ok_or(Error::ReferenceOverflow)
+  }
+
+  pub(crate) fn add_attachment_reference(&mut self, id: ObjectId) -> Result<(), Error> {
+    let slot = self.slot_mut(id)?;
+    slot.attachment_references = slot
+      .attachment_references
+      .checked_add(1)
+      .ok_or(Error::ReferenceOverflow)?;
+    Ok(())
+  }
+
+  pub(crate) fn remove_attachment_reference(&mut self, id: ObjectId) -> Result<(), Error> {
+    let slot = self.slot_mut(id)?;
+    slot.attachment_references = slot
+      .attachment_references
+      .checked_sub(1)
+      .ok_or(Error::ReferenceUnderflow)?;
+    Ok(())
+  }
+
   pub(crate) fn rollback_unreferenced_insert(&mut self, id: ObjectId) -> Result<(), Error> {
     let slot = self.slot_mut(id)?;
-    if slot.capability_references != 0 {
+    if slot.capability_references != 0
+      || slot.mapping_references != 0
+      || slot.attachment_references != 0
+    {
       return Err(Error::InvalidObject);
     }
     slot.object.take().ok_or(Error::InvalidObject)?;
@@ -252,8 +438,28 @@ impl ObjectTable {
     Ok(slot.capability_references)
   }
 
+  pub(crate) fn mapping_references(&self, id: ObjectId) -> Result<usize, Error> {
+    let slot = self.slots.get(id.slot()).ok_or(Error::InvalidObject)?;
+    if slot.generation != id.generation() || slot.object.is_none() {
+      return Err(Error::InvalidObject);
+    }
+    Ok(slot.mapping_references)
+  }
+
+  pub(crate) fn attachment_references(&self, id: ObjectId) -> Result<usize, Error> {
+    let slot = self.slots.get(id.slot()).ok_or(Error::InvalidObject)?;
+    if slot.generation != id.generation() || slot.object.is_none() {
+      return Err(Error::InvalidObject);
+    }
+    Ok(slot.attachment_references)
+  }
+
   pub const fn live_count(&self) -> usize {
     self.live
+  }
+
+  pub(crate) fn has_free_slot(&self) -> bool {
+    self.slots.iter().any(|slot| slot.object.is_none())
   }
 
   fn slot_mut(&mut self, id: ObjectId) -> Result<&mut ObjectSlot, Error> {
@@ -269,6 +475,11 @@ impl Default for ObjectTable {
   fn default() -> Self {
     Self::new()
   }
+}
+
+#[cfg(test)]
+pub(crate) fn memory_object_for_test(frame_start: u64) -> MemoryObject {
+  MemoryObject::new(frame_allocator::frame_block_for_test(frame_start, 1)).unwrap()
 }
 
 #[cfg(test)]
@@ -301,7 +512,7 @@ mod tests {
   #[test]
   fn obj_002_inserted_object_preserves_type_and_payload() {
     let mut table = ObjectTable::new();
-    let memory = MemoryObject::new(0x8040_0000).unwrap();
+    let memory = memory_object_for_test(0x8040_0000);
     let id = table.insert(KernelObject::Memory(memory)).unwrap();
     assert_eq!(table.get(id).unwrap().object_type(), ObjectType::Memory);
     assert_eq!(
@@ -322,21 +533,18 @@ mod tests {
   }
 
   #[test]
-  fn obj_004_memory_object_requires_one_aligned_nonzero_page() {
-    assert_eq!(MemoryObject::new(0), Err(Error::InvalidMemoryFrame));
-    assert_eq!(
-      MemoryObject::new(0x8040_0001),
-      Err(Error::InvalidMemoryFrame)
-    );
+  fn obj_004_memory_object_requires_exactly_one_frame() {
+    assert!(MemoryObject::new(frame_allocator::frame_block_for_test(0, 1)).is_err());
+    assert!(MemoryObject::new(frame_allocator::frame_block_for_test(0x8040_0001, 1)).is_err());
+    assert!(MemoryObject::new(frame_allocator::frame_block_for_test(0x8040_0000, 2)).is_err());
+    assert!(MemoryObject::new(frame_allocator::frame_block_for_test(0x8040_0000, 1)).is_ok());
   }
 
   #[test]
   fn obj_005_reference_count_is_checked() {
     let mut table = ObjectTable::new();
     let id = table
-      .insert(KernelObject::Memory(
-        MemoryObject::new(0x8040_0000).unwrap(),
-      ))
+      .insert(KernelObject::Memory(memory_object_for_test(0x8040_0000)))
       .unwrap();
     assert_eq!(table.capability_references(id), Ok(0));
     table.add_capability_reference(id).unwrap();
@@ -350,12 +558,106 @@ mod tests {
   }
 
   #[test]
+  fn obj_008_mapping_reference_is_independent_from_capability_reference() {
+    let mut table = ObjectTable::new();
+    let id = table
+      .insert(KernelObject::Memory(memory_object_for_test(0x8060_0000)))
+      .unwrap();
+    assert_eq!(table.can_add_mapping_reference(id), Ok(()));
+    table.add_capability_reference(id).unwrap();
+    table.add_mapping_reference(id).unwrap();
+    assert_eq!(table.capability_references(id), Ok(1));
+    assert_eq!(table.mapping_references(id), Ok(1));
+    table.remove_capability_reference(id).unwrap();
+    assert_eq!(table.capability_references(id), Ok(0));
+    assert_eq!(table.mapping_references(id), Ok(1));
+    assert_eq!(
+      table.rollback_unreferenced_insert(id),
+      Err(Error::InvalidObject)
+    );
+    table.remove_mapping_reference(id).unwrap();
+    assert_eq!(table.mapping_references(id), Ok(0));
+  }
+
+  #[test]
+  fn obj_027_attachment_reference_is_independent_from_other_references() {
+    let mut table = ObjectTable::new();
+    let id = table
+      .insert(KernelObject::Process(process_object()))
+      .unwrap();
+    assert_eq!(table.can_add_attachment_reference(id), Ok(()));
+    table.add_attachment_reference(id).unwrap();
+    assert_eq!(table.attachment_references(id), Ok(1));
+    assert_eq!(table.capability_references(id), Ok(0));
+    assert_eq!(table.mapping_references(id), Ok(0));
+    assert_eq!(
+      table.rollback_unreferenced_insert(id),
+      Err(Error::InvalidObject)
+    );
+    table.remove_attachment_reference(id).unwrap();
+    table.rollback_unreferenced_insert(id).unwrap();
+  }
+
+  #[test]
+  fn obj_028_attachment_reference_rejects_underflow() {
+    let mut table = ObjectTable::new();
+    let id = table
+      .insert(KernelObject::Process(process_object()))
+      .unwrap();
+    assert_eq!(
+      table.remove_attachment_reference(id),
+      Err(Error::ReferenceUnderflow)
+    );
+  }
+
+  #[test]
+  fn obj_029_memory_object_starts_zeroed_without_user_image() {
+    let memory = memory_object_for_test(0x8500_0000);
+    assert!(!memory.is_user_image_ready());
+    assert_eq!(memory.user_image_bytes(), None);
+  }
+
+  #[test]
+  fn obj_030_user_image_state_is_single_assignment() {
+    let mut memory = memory_object_for_test(0x8500_0000);
+    memory.mark_user_image_for_test(16).unwrap();
+    assert!(memory.is_user_image_ready());
+    assert_eq!(memory.user_image_bytes(), Some(16));
+    assert_eq!(
+      memory.mark_user_image_for_test(16),
+      Err(Error::UserImageAlreadyInitialized)
+    );
+  }
+
+  #[test]
+  fn obj_031_user_image_size_must_be_nonzero_aligned_and_page_bounded() {
+    let mut empty = memory_object_for_test(0x8500_0000);
+    assert_eq!(
+      empty.mark_user_image_for_test(0),
+      Err(Error::InvalidUserImage)
+    );
+
+    let mut unaligned = memory_object_for_test(0x8500_1000);
+    assert_eq!(
+      unaligned.mark_user_image_for_test(3),
+      Err(Error::InvalidUserImage)
+    );
+
+    let mut oversized = memory_object_for_test(0x8500_2000);
+    assert_eq!(
+      oversized.mark_user_image_for_test(PAGE_SIZE as usize + 4),
+      Err(Error::InvalidUserImage)
+    );
+  }
+
+  #[test]
   fn obj_006_same_physical_page_cannot_back_two_memory_objects() {
     let mut table = ObjectTable::new();
-    let frame = MemoryObject::new(0x8040_0000).unwrap();
-    table.insert(KernelObject::Memory(frame)).unwrap();
+    table
+      .insert(KernelObject::Memory(memory_object_for_test(0x8040_0000)))
+      .unwrap();
     assert!(matches!(
-      table.insert(KernelObject::Memory(frame)),
+      table.insert(KernelObject::Memory(memory_object_for_test(0x8040_0000))),
       Err(Error::DuplicateObject)
     ));
   }
@@ -366,13 +668,11 @@ mod tests {
     for index in 0..MAX_OBJECTS {
       let frame = 0x8100_0000 + (index as u64) * PAGE_SIZE;
       table
-        .insert(KernelObject::Memory(MemoryObject::new(frame).unwrap()))
+        .insert(KernelObject::Memory(memory_object_for_test(frame)))
         .unwrap();
     }
     assert!(matches!(
-      table.insert(KernelObject::Memory(
-        MemoryObject::new(0x9000_0000).unwrap()
-      )),
+      table.insert(KernelObject::Memory(memory_object_for_test(0x9000_0000))),
       Err(Error::TableFull)
     ));
   }
@@ -405,5 +705,12 @@ mod tests {
     assert!(thread.as_process().is_none());
     assert!(thread.as_memory().is_none());
     assert!(thread.as_address_space().is_none());
+  }
+
+  #[test]
+  fn obj_012_object_id_raw_encoding_preserves_generation() {
+    let id = ObjectId::from_raw_parts(7, 19);
+    assert_eq!(ObjectId::from_raw(id.into_raw()), Some(id));
+    assert_eq!(ObjectId::from_raw(0), None);
   }
 }
