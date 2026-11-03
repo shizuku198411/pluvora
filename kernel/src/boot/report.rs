@@ -230,6 +230,16 @@ pub fn trap_ready(stvec: usize) {
   console::write_line("  Mode              : direct");
 }
 
+pub fn user_trap_boundary(scratch: usize) {
+  section("User Trap Boundary");
+  usize_field("Idle sscratch", scratch);
+  console::write_line("  U-mode entry      : armed kernel stack");
+  console::write_line("  Trap stack pivot  : sscratch exchange");
+  console::write_line("  Handler scratch   : cleared");
+  console::write_line("  User exceptions   : termination policy classified");
+  console::write_line("  Runnable users    : disabled");
+}
+
 pub fn hart_bootstrap(boot_index: usize, requested: usize, online: usize) {
   section("Multi-hart Bootstrap");
   usize_field("Boot hart index", boot_index);

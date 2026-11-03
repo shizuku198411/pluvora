@@ -64,6 +64,9 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
   let stvec = trap::install();
   ipi::enable_local();
   report::trap_ready(stvec);
+  let scratch =
+    trap::idle_scratch().unwrap_or_else(|error| fail("User Trap Boundary", error.as_str()));
+  report::user_trap_boundary(scratch);
 
   let boot_index = hart::initialize_boot_hart(&platform, hart_id)
     .unwrap_or_else(|error| fail("Harts", error.as_str()));

@@ -1,5 +1,6 @@
 #[cfg(target_arch = "riscv64")]
 use core::arch::asm;
+use core::mem::{offset_of, size_of};
 
 #[cfg(target_arch = "riscv64")]
 use crate::{
@@ -37,6 +38,21 @@ pub const USER_STACK_ALIGNMENT: usize = 16;
 pub enum PrivilegeMode {
   User,
   Supervisor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundaryError {
+  InvalidKernelStack,
+  ScratchNotClear,
+}
+
+impl BoundaryError {
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::InvalidKernelStack => "user trap kernel stack is invalid",
+      Self::ScratchNotClear => "S-mode sscratch invariant is not clear",
+    }
+  }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +106,14 @@ impl TrapFrame {
     privilege_mode_from_sstatus(self.sstatus)
   }
 
+  pub const fn origin(&self) -> PrivilegeMode {
+    self.privilege_mode()
+  }
+
+  pub const fn is_user_origin(&self) -> bool {
+    matches!(self.origin(), PrivilegeMode::User)
+  }
+
   pub const fn stack_pointer(&self) -> usize {
     self.registers[2]
   }
@@ -110,6 +134,15 @@ impl TrapFrame {
     self.stval
   }
 }
+
+const _: () = {
+  assert!(size_of::<TrapFrame>() == 36 * size_of::<usize>());
+  assert!(offset_of!(TrapFrame, registers) == 0);
+  assert!(offset_of!(TrapFrame, sstatus) == 32 * size_of::<usize>());
+  assert!(offset_of!(TrapFrame, sepc) == 33 * size_of::<usize>());
+  assert!(offset_of!(TrapFrame, scause) == 34 * size_of::<usize>());
+  assert!(offset_of!(TrapFrame, stval) == 35 * size_of::<usize>());
+};
 
 const fn initial_user_sstatus() -> usize {
   let mut status = SSTATUS_SPIE | SSTATUS_UXL_64;
@@ -159,6 +192,25 @@ pub enum Exception {
   LoadPageFault,
   StorePageFault,
   Unknown(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserExceptionAction {
+  ExitRequested,
+  TerminateFault,
+}
+
+pub const fn user_exception_action(exception: Exception) -> UserExceptionAction {
+  match exception {
+    Exception::UserEnvironmentCall => UserExceptionAction::ExitRequested,
+    Exception::IllegalInstruction
+    | Exception::Breakpoint
+    | Exception::SupervisorEnvironmentCall
+    | Exception::InstructionPageFault
+    | Exception::LoadPageFault
+    | Exception::StorePageFault
+    | Exception::Unknown(_) => UserExceptionAction::TerminateFault,
+  }
 }
 
 impl Exception {
@@ -226,14 +278,69 @@ unsafe extern "C" {
 pub fn install() -> usize {
   let address = trap_entry as *const () as usize;
   // SAFETY: trap_entry is 4-byte aligned assembly code using direct mode.
-  unsafe { asm!("csrw stvec, {address}", address = in(reg) address, options(nostack)) };
+  // S-mode execution keeps sscratch clear until a user return is armed.
+  unsafe {
+    asm!(
+      "csrw sscratch, zero",
+      "csrw stvec, {address}",
+      address = in(reg) address,
+      options(nostack),
+    )
+  };
   address
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn idle_scratch() -> Result<usize, BoundaryError> {
+  let value: usize;
+  // SAFETY: reading sscratch is permitted in S-mode.
+  unsafe { asm!("csrr {value}, sscratch", value = out(reg) value, options(nostack)) };
+  if value != 0 {
+    return Err(BoundaryError::ScratchNotClear);
+  }
+  Ok(value)
+}
+
+fn validate_kernel_stack_top(kernel_stack_top: usize) -> Result<(), BoundaryError> {
+  if kernel_stack_top == 0
+    || !kernel_stack_top.is_multiple_of(crate::arch::riscv64::context::KERNEL_STACK_ALIGNMENT)
+  {
+    return Err(BoundaryError::InvalidKernelStack);
+  }
+  Ok(())
+}
+
+#[cfg(target_arch = "riscv64")]
+#[expect(dead_code, reason = "used when user dispatch is enabled")]
+pub(crate) unsafe fn arm_user_trap_stack(kernel_stack_top: usize) -> Result<(), BoundaryError> {
+  validate_kernel_stack_top(kernel_stack_top)?;
+  idle_scratch()?;
+  // SAFETY: caller owns the current hart transition to U-mode and supplied the
+  // current Thread's live kernel stack top.
+  unsafe {
+    asm!(
+      "csrw sscratch, {top}",
+      top = in(reg) kernel_stack_top,
+      options(nostack),
+    )
+  };
+  Ok(())
+}
+
+#[cfg(target_arch = "riscv64")]
+#[expect(dead_code, reason = "used when user dispatch is enabled")]
+pub(crate) fn disarm_user_trap_stack() {
+  // SAFETY: caller has returned to a stable S-mode stack.
+  unsafe { asm!("csrw sscratch, zero", options(nostack)) };
 }
 
 #[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
 extern "C" fn trap_handler(frame: &mut TrapFrame) {
   let cause = Cause::from_scause(frame.scause);
+  if frame.is_user_origin() {
+    unexpected_user_trap(frame, cause);
+  }
 
   if cause == Cause::Interrupt(Interrupt::SupervisorSoftware) {
     ipi::handle_local();
@@ -258,6 +365,20 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
   }
 
   fatal_trap(frame, cause)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn unexpected_user_trap(frame: &TrapFrame, cause: Cause) -> ! {
+  console::newline();
+  console::write_line("[Unexpected U-mode Trap]");
+  console::write("  Cause             : ");
+  console::write_line(cause.name());
+  field("scause", frame.scause());
+  field("sepc", frame.sepc());
+  field("stval", frame.stval());
+  field("sstatus", frame.sstatus());
+  field("Saved user sp", frame.stack_pointer());
+  cpu::halt()
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -288,8 +409,6 @@ fn field(label: &str, value: usize) {
 
 #[cfg(test)]
 mod tests {
-  use core::mem::{offset_of, size_of};
-
   use super::*;
 
   #[test]
@@ -435,5 +554,50 @@ mod tests {
       privilege_mode_from_sstatus(SSTATUS_SPP),
       PrivilegeMode::Supervisor
     );
+  }
+
+  #[test]
+  fn trap_015_initial_user_frame_reports_user_origin() {
+    let frame = TrapFrame::initial_user(0x1000, 0x4000).unwrap();
+    assert_eq!(frame.origin(), PrivilegeMode::User);
+    assert!(frame.is_user_origin());
+  }
+
+  #[test]
+  fn trap_016_user_ecall_requests_controlled_exit() {
+    assert_eq!(
+      user_exception_action(Exception::UserEnvironmentCall),
+      UserExceptionAction::ExitRequested
+    );
+  }
+
+  #[test]
+  fn trap_017_user_faults_require_termination() {
+    for exception in [
+      Exception::IllegalInstruction,
+      Exception::Breakpoint,
+      Exception::InstructionPageFault,
+      Exception::LoadPageFault,
+      Exception::StorePageFault,
+      Exception::Unknown(63),
+    ] {
+      assert_eq!(
+        user_exception_action(exception),
+        UserExceptionAction::TerminateFault
+      );
+    }
+  }
+
+  #[test]
+  fn trap_018_kernel_stack_arming_requires_alignment() {
+    assert_eq!(
+      validate_kernel_stack_top(0),
+      Err(BoundaryError::InvalidKernelStack)
+    );
+    assert_eq!(
+      validate_kernel_stack_top(0x8001),
+      Err(BoundaryError::InvalidKernelStack)
+    );
+    assert_eq!(validate_kernel_stack_top(0x8000), Ok(()));
   }
 }
