@@ -668,7 +668,7 @@ impl KernelState {
     virtual_address: u64,
     permissions: crate::arch::riscv64::paging::UserPermissions,
     frames: crate::memory::user_page_table::PreparedMappingFrames,
-  ) -> Result<MappedMemory, MapMemoryFailure> {
+  ) -> Result<MapMemorySuccess, MapMemoryFailure> {
     match self.map_memory_inner(
       authority_space,
       address_space_handle,
@@ -677,7 +677,7 @@ impl KernelState {
       permissions,
       frames,
     ) {
-      Ok(mapped) => Ok(mapped),
+      Ok(success) => Ok(success),
       Err((error, frames)) => Err(MapMemoryFailure { error, frames }),
     }
   }
@@ -691,7 +691,7 @@ impl KernelState {
     virtual_address: u64,
     permissions: crate::arch::riscv64::paging::UserPermissions,
     frames: crate::memory::user_page_table::PreparedMappingFrames,
-  ) -> Result<MappedMemory, (Error, crate::memory::user_page_table::PreparedMappingFrames)> {
+  ) -> Result<MapMemorySuccess, (Error, crate::memory::user_page_table::PreparedMappingFrames)> {
     let capabilities = match self.spaces.get(authority_space) {
       Ok(space) => space,
       Err(error) => return Err((Error::CapabilitySpace(error), frames)),
@@ -725,7 +725,7 @@ impl KernelState {
     if address_space.active_harts() != 0 || address_space.resident_harts() != 0 {
       return Err((Error::AddressSpaceBusy, frames));
     }
-    if address_space.mapping_count() != 0 {
+    if address_space.mapping_count() == crate::memory::address_space::MAX_USER_MAPPINGS {
       return Err((
         Error::UserPageTable(crate::memory::user_page_table::Error::MappingLimit),
         frames,
@@ -741,26 +741,32 @@ impl KernelState {
       .unwrap_or_else(|_| panic!("preflighted Address Space disappeared"))
       .as_address_space_mut()
       .unwrap_or_else(|| panic!("preflighted Address Space changed type"));
-    if let Err(failure) = address_space.map_user_page(
+    let mapping = match address_space.map_user_page(
       memory_id,
       physical_address,
       virtual_address,
       permissions,
       frames,
     ) {
-      let (error, frames) = failure.into_parts();
-      return Err((Error::UserPageTable(error), frames));
-    }
+      Ok(success) => success,
+      Err(failure) => {
+        let (error, frames) = failure.into_parts();
+        return Err((Error::UserPageTable(error), frames));
+      }
+    };
     self
       .objects
       .add_mapping_reference(memory_id)
       .unwrap_or_else(|_| panic!("preflighted mapping reference commit failed"));
 
-    Ok(MappedMemory {
-      memory: memory_id,
-      address_space: address_space_id,
-      virtual_address,
-      permissions,
+    Ok(MapMemorySuccess {
+      mapped: MappedMemory {
+        memory: memory_id,
+        address_space: address_space_id,
+        virtual_address,
+        permissions,
+      },
+      frames: mapping.into_frames(),
     })
   }
 
@@ -1281,6 +1287,26 @@ pub struct MapMemoryFailure {
   frames: crate::memory::user_page_table::PreparedMappingFrames,
 }
 
+pub struct MapMemorySuccess {
+  mapped: MappedMemory,
+  frames: crate::memory::user_page_table::PreparedMappingFrames,
+}
+
+impl MapMemorySuccess {
+  pub const fn mapped(&self) -> MappedMemory {
+    self.mapped
+  }
+
+  pub fn into_parts(
+    self,
+  ) -> (
+    MappedMemory,
+    crate::memory::user_page_table::PreparedMappingFrames,
+  ) {
+    (self.mapped, self.frames)
+  }
+}
+
 impl MapMemoryFailure {
   pub const fn error(&self) -> Error {
     self.error
@@ -1503,7 +1529,13 @@ pub fn map_memory(
     )
   };
   match result {
-    Ok(mapped) => Ok(mapped),
+    Ok(success) => {
+      let (mapped, frames) = success.into_parts();
+      frames
+        .release()
+        .unwrap_or_else(|_| panic!("failed unused mapping frame release"));
+      Ok(mapped)
+    }
     Err(failure) => {
       let (error, frames) = failure.into_parts();
       frames

@@ -1,5 +1,7 @@
 """User Address Space foundation QEMU tests."""
 
+import re
+
 from tests.qemu.harness import QemuTestCase, SUCCESS_MARKER
 
 
@@ -22,20 +24,30 @@ class UserAddressSpaceTests(QemuTestCase):
         self.assertNotIn("[ERROR] User Address Space", self.output)
         self.assertNotIn("[PANIC]", self.output)
 
-    def test_uas_q004_capability_authorized_mapping_is_published(self) -> None:
-        self.assertIn("[Capability User Mapping]", self.output)
-        self.assertRegex(self.output, r"Virtual address\s+: 0x0*1000")
-        self.assertIn("Permissions       : read-write", self.output)
-        self.assertIn("Memory authority  : MAP + READ + WRITE", self.output)
-        self.assertIn("Address authority : MAP", self.output)
-        self.assertIn("Mapping reference : held", self.output)
-        self.assertIn("User PTE          : published last", self.output)
+    def test_uas_q004_capability_authorized_user_image_is_published(self) -> None:
+        self.assertIn("[Capability User Image]", self.output)
+        self.assertRegex(self.output, r"Text virtual\s+: 0x0*1000")
+        self.assertRegex(self.output, r"Stack virtual\s+: 0x0*3000")
+        self.assertRegex(self.output, r"Initial stack top\s+: 0x0*4000")
+        self.assertRegex(self.output, r"Guard page\s+: 0x0*2000")
+        self.assertIn("Text permissions  : read-execute", self.output)
+        self.assertIn("Stack permissions : read-write", self.output)
+        self.assertIn("Guard mapping     : absent", self.output)
+        self.assertIn("Mapping references: two held", self.output)
+        self.assertIn("Shared PT path    : verified", self.output)
 
-    def test_uas_q005_mapping_precedes_kernel_thread_dispatch(self) -> None:
-        mapping = self.output.index("[Capability User Mapping]")
+    def test_uas_q005_user_image_precedes_kernel_thread_dispatch(self) -> None:
+        mapping = self.output.index("[Capability User Image]")
         dispatch = self.output.index("[Kernel Thread Dispatch]")
         self.assertLess(mapping, dispatch)
 
     def test_uas_q006_has_no_user_mapping_failure(self) -> None:
         self.assertNotIn("[ERROR] User Mapping", self.output)
         self.assertNotIn("[PANIC]", self.output)
+
+    def test_uas_q007_text_and_stack_use_distinct_memory_objects(self) -> None:
+        text = re.search(r"Text memory\s+: (0x[0-9a-f]+)", self.output)
+        stack = re.search(r"Stack memory\s+: (0x[0-9a-f]+)", self.output)
+        self.assertIsNotNone(text)
+        self.assertIsNotNone(stack)
+        self.assertNotEqual(text.group(1), stack.group(1))

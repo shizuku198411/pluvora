@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::arch::riscv64::paging::UserPermissions;
 use crate::memory::user_page_table::UserPageTable;
 #[cfg(target_arch = "riscv64")]
-use crate::memory::user_page_table::{MappingFailure, PreparedMappingFrames};
+use crate::memory::user_page_table::{MappingFailure, MappingSuccess, PreparedMappingFrames};
 use crate::object::ObjectId;
 use crate::platform::MAX_HARTS;
 #[cfg(target_arch = "riscv64")]
@@ -11,7 +11,7 @@ use crate::{arch::riscv64::tlb, sync::SpinLock};
 
 const KERNEL_ASID: u16 = 0;
 const KERNEL_GENERATION: u64 = 0;
-pub const MAX_USER_MAPPINGS: usize = 1;
+pub const MAX_USER_MAPPINGS: usize = 2;
 
 const _: () = assert!(MAX_HARTS <= u64::BITS as usize);
 
@@ -168,10 +168,20 @@ impl AddressSpace {
     virtual_address: u64,
     permissions: UserPermissions,
     frames: PreparedMappingFrames,
-  ) -> Result<(), MappingFailure> {
+  ) -> Result<MappingSuccess, MappingFailure> {
     if self.mapping_len == MAX_USER_MAPPINGS {
       return Err(MappingFailure::new(
         crate::memory::user_page_table::Error::MappingLimit,
+        frames,
+      ));
+    }
+    if self.mappings[..self.mapping_len]
+      .iter()
+      .flatten()
+      .any(|mapping| mapping.virtual_address() == virtual_address)
+    {
+      return Err(MappingFailure::new(
+        crate::memory::user_page_table::Error::AlreadyMapped,
         frames,
       ));
     }
@@ -184,14 +194,14 @@ impl AddressSpace {
         ));
       }
     };
-    table.map_user_page(virtual_address, physical_address, permissions, frames)?;
+    let success = table.map_user_page(virtual_address, physical_address, permissions, frames)?;
     self.mappings[self.mapping_len] = Some(MappingRecord {
       memory,
       virtual_address,
       permissions,
     });
     self.mapping_len += 1;
-    Ok(())
+    Ok(success)
   }
 
   pub fn enter_hart(&self, index: usize) -> Result<(), Error> {
@@ -370,5 +380,10 @@ mod tests {
     assert!(!space.is_user());
     assert_eq!(space.mapping_count(), 0);
     assert!(space.mapping(0).is_none());
+  }
+
+  #[test]
+  fn aspace_006_initial_user_image_capacity_is_two_mappings() {
+    assert_eq!(MAX_USER_MAPPINGS, 2);
   }
 }

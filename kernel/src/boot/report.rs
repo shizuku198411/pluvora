@@ -134,16 +134,28 @@ pub fn memory_object(object: crate::object::ObjectId, capability: CapabilityHand
   console::write_line("  Process quota     : charged");
 }
 
-pub fn user_mapping(mapped: crate::kernel_state::MappedMemory) {
-  section("Capability User Mapping");
-  usize_field("Memory identity", mapped.memory.into_raw());
-  usize_field("Address identity", mapped.address_space.into_raw());
-  u64_field("Virtual address", mapped.virtual_address);
-  console::write_line("  Permissions       : read-write");
-  console::write_line("  Memory authority  : MAP + READ + WRITE");
-  console::write_line("  Address authority : MAP");
-  console::write_line("  Mapping reference : held");
-  console::write_line("  User PTE          : published last");
+pub fn user_image(
+  text: crate::kernel_state::MappedMemory,
+  stack: crate::kernel_state::MappedMemory,
+) {
+  section("Capability User Image");
+  usize_field("Text memory", text.memory.into_raw());
+  u64_field("Text virtual", text.virtual_address);
+  console::write_line("  Text permissions  : read-execute");
+  usize_field("Stack memory", stack.memory.into_raw());
+  u64_field("Stack virtual", stack.virtual_address);
+  u64_field(
+    "Initial stack top",
+    crate::memory::user_page_table::USER_STACK_TOP,
+  );
+  u64_field(
+    "Guard page",
+    crate::memory::user_page_table::USER_GUARD_BASE,
+  );
+  console::write_line("  Stack permissions : read-write");
+  console::write_line("  Guard mapping     : absent");
+  console::write_line("  Mapping references: two held");
+  console::write_line("  Shared PT path    : verified");
 }
 
 pub fn runtime_memory(free_frames: usize, stack_top: usize) {

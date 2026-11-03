@@ -134,24 +134,41 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
 
   let process = kernel_state::initialize_bootstrap_process()
     .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
-  let memory = kernel_state::create_memory(kernel_state::bootstrap_space(), process.authority)
+  let text_memory = kernel_state::create_memory(kernel_state::bootstrap_space(), process.authority)
     .unwrap_or_else(|error| fail("Memory Object", error.as_str()));
-  report::memory_object(memory.object, memory.capability);
+  report::memory_object(text_memory.object, text_memory.capability);
+  let stack_memory =
+    kernel_state::create_memory(kernel_state::bootstrap_space(), process.authority)
+      .unwrap_or_else(|error| fail("Memory Object", error.as_str()));
   let user_space = kernel_state::create_user_address_space(
     kernel_state::bootstrap_space(),
     process.authority,
     paging.root_frame(),
   )
   .unwrap_or_else(|error| fail("User Mapping", error.as_str()));
-  let mapped = kernel_state::map_memory(
+  let text_mapping = kernel_state::map_memory(
     process.space,
     user_space.capability,
-    memory.capability,
-    crate::memory::user_page_table::USER_WINDOW_START,
+    text_memory.capability,
+    crate::memory::user_page_table::USER_TEXT_BASE,
+    crate::arch::riscv64::paging::UserPermissions::ReadExecute,
+  )
+  .unwrap_or_else(|error| fail("User Mapping", error.as_str()));
+  let stack_mapping = kernel_state::map_memory(
+    process.space,
+    user_space.capability,
+    stack_memory.capability,
+    crate::memory::user_page_table::USER_STACK_BASE,
     crate::arch::riscv64::paging::UserPermissions::ReadWrite,
   )
   .unwrap_or_else(|error| fail("User Mapping", error.as_str()));
-  report::user_mapping(mapped);
+  if text_mapping.address_space != stack_mapping.address_space {
+    fail(
+      "User Mapping",
+      "user image mappings use different Address Spaces",
+    );
+  }
+  report::user_image(text_mapping, stack_mapping);
   kernel_thread::reset_smoke_state();
   let affinity = 1u64
     .checked_shl(boot_index as u32)

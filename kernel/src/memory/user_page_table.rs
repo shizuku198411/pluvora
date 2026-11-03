@@ -8,6 +8,10 @@ use crate::memory::{PAGE_SIZE, frame_allocator};
 
 pub const USER_WINDOW_START: u64 = PAGE_SIZE;
 pub const USER_WINDOW_END: u64 = 1 << 30;
+pub const USER_TEXT_BASE: u64 = USER_WINDOW_START;
+pub const USER_GUARD_BASE: u64 = USER_TEXT_BASE + PAGE_SIZE;
+pub const USER_STACK_BASE: u64 = USER_GUARD_BASE + PAGE_SIZE;
+pub const USER_STACK_TOP: u64 = USER_STACK_BASE + PAGE_SIZE;
 pub const MAX_OWNED_PAGE_TABLE_FRAMES: usize = 3;
 
 const USER_ROOT_INDEX: usize = 0;
@@ -24,6 +28,7 @@ pub enum Error {
   TableFrameLimit,
   MappingLimit,
   KernelAddressSpace,
+  PreparedFrameShortage,
 }
 
 impl Error {
@@ -39,13 +44,14 @@ impl Error {
       Self::TableFrameLimit => "user page-table frame limit reached",
       Self::MappingLimit => "user Address Space mapping limit reached",
       Self::KernelAddressSpace => "kernel Address Space cannot receive a user mapping",
+      Self::PreparedFrameShortage => "prepared Page Table frames are insufficient",
     }
   }
 }
 
 pub struct PreparedMappingFrames {
-  level_one: frame_allocator::FrameBlock,
-  level_zero: frame_allocator::FrameBlock,
+  level_one: Option<frame_allocator::FrameBlock>,
+  level_zero: Option<frame_allocator::FrameBlock>,
 }
 
 impl PreparedMappingFrames {
@@ -61,24 +67,60 @@ impl PreparedMappingFrames {
       }
     };
     Ok(Self {
-      level_one,
-      level_zero,
+      level_one: Some(level_one),
+      level_zero: Some(level_zero),
     })
   }
 
+  pub const fn available(&self) -> usize {
+    self.level_one.is_some() as usize + self.level_zero.is_some() as usize
+  }
+
+  fn take_level_one(&mut self) -> frame_allocator::FrameBlock {
+    self
+      .level_one
+      .take()
+      .unwrap_or_else(|| panic!("preflighted level-one frame disappeared"))
+  }
+
+  fn take_level_zero(&mut self) -> frame_allocator::FrameBlock {
+    self
+      .level_zero
+      .take()
+      .unwrap_or_else(|| panic!("preflighted level-zero frame disappeared"))
+  }
+
   #[cfg(target_arch = "riscv64")]
-  pub fn release(self) -> Result<(), Error> {
-    frame_allocator::release(self.level_zero)?;
-    frame_allocator::release(self.level_one)?;
+  pub fn release(mut self) -> Result<(), Error> {
+    if let Some(frame) = self.level_zero.take() {
+      frame_allocator::release(frame)?;
+    }
+    if let Some(frame) = self.level_one.take() {
+      frame_allocator::release(frame)?;
+    }
     Ok(())
   }
 
   #[cfg(test)]
   pub(crate) fn for_test(level_one: u64, level_zero: u64) -> Self {
     Self {
-      level_one: frame_allocator::frame_block_for_test(level_one, 1),
-      level_zero: frame_allocator::frame_block_for_test(level_zero, 1),
+      level_one: Some(frame_allocator::frame_block_for_test(level_one, 1)),
+      level_zero: Some(frame_allocator::frame_block_for_test(level_zero, 1)),
     }
+  }
+}
+
+pub struct MappingSuccess {
+  frames: PreparedMappingFrames,
+}
+
+impl MappingSuccess {
+  const fn new(frames: PreparedMappingFrames) -> Self {
+    Self { frames }
+  }
+
+  pub fn into_frames(self) -> PreparedMappingFrames {
+    self.frames
   }
 }
 
@@ -169,64 +211,122 @@ impl UserPageTable {
     virtual_address: u64,
     physical_address: u64,
     permissions: UserPermissions,
-    frames: PreparedMappingFrames,
-  ) -> Result<(), MappingFailure> {
+    mut frames: PreparedMappingFrames,
+  ) -> Result<MappingSuccess, MappingFailure> {
     if let Err(error) = validate_user_page(virtual_address) {
       return Err(MappingFailure::new(error, frames));
     }
     if let Err(error) = validate_physical_page(physical_address) {
       return Err(MappingFailure::new(error, frames));
     }
-    if self.mapped_pages != 0 {
-      return Err(MappingFailure::new(Error::MappingLimit, frames));
-    }
-    if self.owned_len + 2 > MAX_OWNED_PAGE_TABLE_FRAMES {
-      return Err(MappingFailure::new(Error::TableFrameLimit, frames));
-    }
-
     let indices = paging::vpn_indices(virtual_address);
     let root_entry = match read_entry(self.root_frame, indices[2]) {
       Ok(entry) => entry,
       Err(error) => return Err(MappingFailure::new(error, frames)),
     };
-    if root_entry & PTE_VALID != 0 {
-      let error = if paging::is_leaf(root_entry) {
-        Error::LeafWhereTableExpected
-      } else {
-        Error::AlreadyMapped
-      };
-      return Err(MappingFailure::new(error, frames));
+    if root_entry & PTE_VALID != 0 && paging::is_leaf(root_entry) {
+      return Err(MappingFailure::new(Error::LeafWhereTableExpected, frames));
     }
 
-    let PreparedMappingFrames {
-      level_one,
-      level_zero,
-    } = frames;
+    let level_one_frame = if root_entry & PTE_VALID == 0 {
+      None
+    } else {
+      Some(paging::pte_physical_address(root_entry))
+    };
+    let level_one_entry = match level_one_frame {
+      Some(frame) => match read_entry(frame, indices[1]) {
+        Ok(entry) => entry,
+        Err(error) => return Err(MappingFailure::new(error, frames)),
+      },
+      None => 0,
+    };
+    if level_one_entry & PTE_VALID != 0 && paging::is_leaf(level_one_entry) {
+      return Err(MappingFailure::new(Error::LeafWhereTableExpected, frames));
+    }
 
-    write_entry(
-      level_one.start(),
-      indices[1],
-      paging::table_pointer(level_zero.start()),
-    )
-    .unwrap_or_else(|_| panic!("validated level-one Page Table write failed"));
-    write_entry(
-      level_zero.start(),
-      indices[0],
-      paging::table_pointer(physical_address) | permissions.pte_flags(),
-    )
-    .unwrap_or_else(|_| panic!("validated user leaf write failed"));
-    write_entry(
-      self.root_frame,
-      indices[2],
-      paging::table_pointer(level_one.start()),
-    )
-    .unwrap_or_else(|_| panic!("validated user root write failed"));
+    let level_zero_frame = if level_one_entry & PTE_VALID == 0 {
+      None
+    } else {
+      Some(paging::pte_physical_address(level_one_entry))
+    };
+    if let Some(frame) = level_zero_frame {
+      let leaf = match read_entry(frame, indices[0]) {
+        Ok(entry) => entry,
+        Err(error) => return Err(MappingFailure::new(error, frames)),
+      };
+      if leaf & PTE_VALID != 0 {
+        return Err(MappingFailure::new(Error::AlreadyMapped, frames));
+      }
+    }
 
-    self.owned[self.owned_len] = Some(level_one);
-    self.owned[self.owned_len + 1] = Some(level_zero);
-    self.owned_len += 2;
-    self.mapped_pages += 1;
-    Ok(())
+    let required_frames =
+      usize::from(level_one_frame.is_none()) + usize::from(level_zero_frame.is_none());
+    if frames.available() < required_frames {
+      return Err(MappingFailure::new(Error::PreparedFrameShortage, frames));
+    }
+    if self.owned_len + required_frames > MAX_OWNED_PAGE_TABLE_FRAMES {
+      return Err(MappingFailure::new(Error::TableFrameLimit, frames));
+    }
+
+    match (level_one_frame, level_zero_frame) {
+      (None, None) => {
+        let level_one = frames.take_level_one();
+        let level_zero = frames.take_level_zero();
+        write_entry(
+          level_one.start(),
+          indices[1],
+          paging::table_pointer(level_zero.start()),
+        )
+        .unwrap_or_else(|_| panic!("validated level-one Page Table write failed"));
+        write_entry(
+          level_zero.start(),
+          indices[0],
+          paging::table_pointer(physical_address) | permissions.pte_flags(),
+        )
+        .unwrap_or_else(|_| panic!("validated user leaf write failed"));
+        write_entry(
+          self.root_frame,
+          indices[2],
+          paging::table_pointer(level_one.start()),
+        )
+        .unwrap_or_else(|_| panic!("validated user root write failed"));
+        self.owned[self.owned_len] = Some(level_one);
+        self.owned[self.owned_len + 1] = Some(level_zero);
+        self.owned_len += 2;
+      }
+      (Some(level_one), None) => {
+        let level_zero = frames.take_level_zero();
+        write_entry(
+          level_zero.start(),
+          indices[0],
+          paging::table_pointer(physical_address) | permissions.pte_flags(),
+        )
+        .unwrap_or_else(|_| panic!("validated user leaf write failed"));
+        write_entry(
+          level_one,
+          indices[1],
+          paging::table_pointer(level_zero.start()),
+        )
+        .unwrap_or_else(|_| panic!("validated level-one Page Table write failed"));
+        self.owned[self.owned_len] = Some(level_zero);
+        self.owned_len += 1;
+      }
+      (Some(_), Some(level_zero)) => {
+        write_entry(
+          level_zero,
+          indices[0],
+          paging::table_pointer(physical_address) | permissions.pte_flags(),
+        )
+        .unwrap_or_else(|_| panic!("validated user leaf write failed"));
+      }
+      (None, Some(_)) => panic!("level-zero table exists without level-one parent"),
+    }
+
+    self.mapped_pages = self
+      .mapped_pages
+      .checked_add(1)
+      .unwrap_or_else(|| panic!("user mapping count overflow"));
+    Ok(MappingSuccess::new(frames))
   }
 
   #[cfg(target_arch = "riscv64")]
@@ -278,7 +378,15 @@ fn write_entry(table: u64, index: usize, value: u64) -> Result<(), Error> {
   Ok(())
 }
 
-const _: () = assert!(USER_ROOT_INDEX < ENTRIES_PER_TABLE);
+const _: () = {
+  assert!(USER_ROOT_INDEX < ENTRIES_PER_TABLE);
+  assert!(USER_TEXT_BASE >= USER_WINDOW_START);
+  assert!(USER_STACK_TOP <= USER_WINDOW_END);
+  assert!(USER_TEXT_BASE.is_multiple_of(PAGE_SIZE));
+  assert!(USER_GUARD_BASE.is_multiple_of(PAGE_SIZE));
+  assert!(USER_STACK_BASE.is_multiple_of(PAGE_SIZE));
+  assert!(USER_STACK_TOP.is_multiple_of(PAGE_SIZE));
+};
 
 #[cfg(test)]
 mod tests {
@@ -366,7 +474,41 @@ mod tests {
     let failure = MappingFailure::new(Error::InvalidVirtualAddress, frames);
     let (error, frames) = failure.into_parts();
     assert_eq!(error, Error::InvalidVirtualAddress);
-    assert_eq!(frames.level_one.start(), 0x8100_0000);
-    assert_eq!(frames.level_zero.start(), 0x8100_1000);
+    assert_eq!(frames.level_one.as_ref().unwrap().start(), 0x8100_0000);
+    assert_eq!(frames.level_zero.as_ref().unwrap().start(), 0x8100_1000);
+  }
+
+  #[test]
+  fn uas_008_initial_text_guard_and_stack_layout_is_page_aligned() {
+    assert_eq!(USER_TEXT_BASE, USER_WINDOW_START);
+    assert_eq!(USER_GUARD_BASE, USER_TEXT_BASE + PAGE_SIZE);
+    assert_eq!(USER_STACK_BASE, USER_GUARD_BASE + PAGE_SIZE);
+    assert_eq!(USER_STACK_TOP, USER_STACK_BASE + PAGE_SIZE);
+    assert_eq!(
+      USER_STACK_TOP as usize % crate::arch::riscv64::trap::USER_STACK_ALIGNMENT,
+      0
+    );
+  }
+
+  #[test]
+  fn uas_009_initial_text_and_stack_share_page_table_path() {
+    let text = paging::vpn_indices(USER_TEXT_BASE);
+    let stack = paging::vpn_indices(USER_STACK_BASE);
+    assert_eq!(text[2], stack[2]);
+    assert_eq!(text[1], stack[1]);
+    assert_ne!(text[0], stack[0]);
+  }
+
+  #[test]
+  fn uas_010_prepared_pool_tracks_remaining_ownership() {
+    let mut frames = PreparedMappingFrames::for_test(0x8100_0000, 0x8100_1000);
+    assert_eq!(frames.available(), 2);
+    let level_zero = frames.take_level_zero();
+    assert_eq!(level_zero.start(), 0x8100_1000);
+    assert_eq!(frames.available(), 1);
+    let mut frames = MappingSuccess::new(frames).into_frames();
+    let level_one = frames.take_level_one();
+    assert_eq!(level_one.start(), 0x8100_0000);
+    assert_eq!(frames.available(), 0);
   }
 }
