@@ -123,6 +123,17 @@ pub fn kernel_thread(
   console::write_line("  Boot context      : restored");
 }
 
+pub fn memory_object(object: crate::object::ObjectId, capability: CapabilityHandle) {
+  section("Owned Memory Object");
+  usize_field("Object identity", object.into_raw());
+  usize_field("Capability slot", capability.slot() as usize);
+  u64_field("Capability generation", u64::from(capability.generation()));
+  usize_field("Page count", 1);
+  console::write_line("  Allocation        : zero-filled runtime frame");
+  console::write_line("  Ownership         : Memory Object");
+  console::write_line("  Process quota     : charged");
+}
+
 pub fn runtime_memory(free_frames: usize, stack_top: usize) {
   section("Runtime Memory");
   usize_field("Free frames", free_frames);

@@ -46,22 +46,22 @@ impl From<super::Error> for Error {
   }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct FrameBlock {
   start: u64,
   frames: usize,
 }
 
 impl FrameBlock {
-  pub const fn start(self) -> u64 {
+  pub const fn start(&self) -> u64 {
     self.start
   }
 
-  pub const fn frames(self) -> usize {
+  pub const fn frames(&self) -> usize {
     self.frames
   }
 
-  pub fn bytes(self) -> Option<u64> {
+  pub fn bytes(&self) -> Option<u64> {
     (self.frames as u64).checked_mul(PAGE_SIZE)
   }
 }
@@ -358,21 +358,21 @@ mod tests {
     let storage = TestMemory::new(8);
     let mut allocator = allocator(&storage);
     let block = allocator.allocate(4).unwrap();
+    let start = block.start();
     unsafe { ptr::write_bytes(block.start() as *mut u8, 0x5a, 4 * 4096) };
     allocator.release(block).unwrap();
     let reused = allocator.allocate(4).unwrap();
-    assert_eq!(reused.start(), block.start());
+    assert_eq!(reused.start(), start);
     let bytes = unsafe { core::slice::from_raw_parts(reused.start() as *const u8, 4 * 4096) };
     assert!(bytes.iter().all(|byte| *byte == 0));
   }
 
   #[test]
-  fn frame_003_double_free_is_rejected() {
+  fn frame_003_foreign_block_is_rejected() {
     let storage = TestMemory::new(8);
     let mut allocator = allocator(&storage);
-    let block = allocator.allocate(1).unwrap();
-    allocator.release(block).unwrap();
-    assert_eq!(allocator.release(block), Err(Error::DoubleFree));
+    let foreign = frame_block_for_test(0x1000, 1);
+    assert_eq!(allocator.release(foreign), Err(Error::ForeignBlock));
   }
 
   #[test]

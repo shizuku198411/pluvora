@@ -1,4 +1,4 @@
-use crate::memory::{PAGE_SIZE, address_space::AddressSpace};
+use crate::memory::{PAGE_SIZE, address_space::AddressSpace, frame_allocator};
 use crate::process::Process;
 use crate::thread::Thread;
 
@@ -60,21 +60,25 @@ impl ObjectId {
   }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct MemoryObject {
-  frame_start: u64,
+  frame: frame_allocator::FrameBlock,
 }
 
 impl MemoryObject {
-  pub fn new(frame_start: u64) -> Result<Self, Error> {
-    if frame_start == 0 || !frame_start.is_multiple_of(PAGE_SIZE) {
+  pub fn new(frame: frame_allocator::FrameBlock) -> Result<Self, Error> {
+    if frame.start() == 0 || !frame.start().is_multiple_of(PAGE_SIZE) || frame.frames() != 1 {
       return Err(Error::InvalidMemoryFrame);
     }
-    Ok(Self { frame_start })
+    Ok(Self { frame })
   }
 
-  pub fn frame_start(self) -> u64 {
-    self.frame_start
+  pub const fn frame_start(&self) -> u64 {
+    self.frame.start()
+  }
+
+  pub fn into_frame(self) -> frame_allocator::FrameBlock {
+    self.frame
   }
 }
 
@@ -139,7 +143,7 @@ impl KernelObject {
 
   fn has_same_identity(&self, other: &Self) -> bool {
     match (self, other) {
-      (Self::Memory(left), Self::Memory(right)) => left == right,
+      (Self::Memory(left), Self::Memory(right)) => left.frame_start() == right.frame_start(),
       (Self::AddressSpace(left), Self::AddressSpace(right)) => {
         left.root_frame() == right.root_frame() && left.asid() == right.asid()
       }
@@ -292,6 +296,11 @@ impl Default for ObjectTable {
 }
 
 #[cfg(test)]
+pub(crate) fn memory_object_for_test(frame_start: u64) -> MemoryObject {
+  MemoryObject::new(frame_allocator::frame_block_for_test(frame_start, 1)).unwrap()
+}
+
+#[cfg(test)]
 mod tests {
   use crate::capability_space::CapabilitySpaceId;
   use crate::memory::address_space::Asid;
@@ -321,7 +330,7 @@ mod tests {
   #[test]
   fn obj_002_inserted_object_preserves_type_and_payload() {
     let mut table = ObjectTable::new();
-    let memory = MemoryObject::new(0x8040_0000).unwrap();
+    let memory = memory_object_for_test(0x8040_0000);
     let id = table.insert(KernelObject::Memory(memory)).unwrap();
     assert_eq!(table.get(id).unwrap().object_type(), ObjectType::Memory);
     assert_eq!(
@@ -342,21 +351,18 @@ mod tests {
   }
 
   #[test]
-  fn obj_004_memory_object_requires_one_aligned_nonzero_page() {
-    assert_eq!(MemoryObject::new(0), Err(Error::InvalidMemoryFrame));
-    assert_eq!(
-      MemoryObject::new(0x8040_0001),
-      Err(Error::InvalidMemoryFrame)
-    );
+  fn obj_004_memory_object_requires_exactly_one_frame() {
+    assert!(MemoryObject::new(frame_allocator::frame_block_for_test(0, 1)).is_err());
+    assert!(MemoryObject::new(frame_allocator::frame_block_for_test(0x8040_0001, 1)).is_err());
+    assert!(MemoryObject::new(frame_allocator::frame_block_for_test(0x8040_0000, 2)).is_err());
+    assert!(MemoryObject::new(frame_allocator::frame_block_for_test(0x8040_0000, 1)).is_ok());
   }
 
   #[test]
   fn obj_005_reference_count_is_checked() {
     let mut table = ObjectTable::new();
     let id = table
-      .insert(KernelObject::Memory(
-        MemoryObject::new(0x8040_0000).unwrap(),
-      ))
+      .insert(KernelObject::Memory(memory_object_for_test(0x8040_0000)))
       .unwrap();
     assert_eq!(table.capability_references(id), Ok(0));
     table.add_capability_reference(id).unwrap();
@@ -372,10 +378,11 @@ mod tests {
   #[test]
   fn obj_006_same_physical_page_cannot_back_two_memory_objects() {
     let mut table = ObjectTable::new();
-    let frame = MemoryObject::new(0x8040_0000).unwrap();
-    table.insert(KernelObject::Memory(frame)).unwrap();
+    table
+      .insert(KernelObject::Memory(memory_object_for_test(0x8040_0000)))
+      .unwrap();
     assert!(matches!(
-      table.insert(KernelObject::Memory(frame)),
+      table.insert(KernelObject::Memory(memory_object_for_test(0x8040_0000))),
       Err(Error::DuplicateObject)
     ));
   }
@@ -386,13 +393,11 @@ mod tests {
     for index in 0..MAX_OBJECTS {
       let frame = 0x8100_0000 + (index as u64) * PAGE_SIZE;
       table
-        .insert(KernelObject::Memory(MemoryObject::new(frame).unwrap()))
+        .insert(KernelObject::Memory(memory_object_for_test(frame)))
         .unwrap();
     }
     assert!(matches!(
-      table.insert(KernelObject::Memory(
-        MemoryObject::new(0x9000_0000).unwrap()
-      )),
+      table.insert(KernelObject::Memory(memory_object_for_test(0x9000_0000))),
       Err(Error::TableFull)
     ));
   }

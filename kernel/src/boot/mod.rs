@@ -134,6 +134,9 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
 
   let process = kernel_state::initialize_bootstrap_process()
     .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  let memory = kernel_state::create_memory(kernel_state::bootstrap_space(), process.authority)
+    .unwrap_or_else(|error| fail("Memory Object", error.as_str()));
+  report::memory_object(memory.object, memory.capability);
   kernel_thread::reset_smoke_state();
   let affinity = 1u64
     .checked_shl(boot_index as u32)

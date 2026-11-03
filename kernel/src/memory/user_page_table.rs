@@ -52,7 +52,7 @@ impl From<paging::Error> for Error {
 }
 
 pub struct UserPageTable {
-  root: frame_allocator::FrameBlock,
+  root_frame: u64,
   owned: [Option<frame_allocator::FrameBlock>; MAX_OWNED_PAGE_TABLE_FRAMES],
   owned_len: usize,
   mapped_pages: usize,
@@ -67,7 +67,8 @@ impl UserPageTable {
     }
 
     let root = frame_allocator::allocate(1)?;
-    let root_address = usize::try_from(root.start()).map_err(|_| Error::InvalidPhysicalAddress)?;
+    let root_frame = root.start();
+    let root_address = usize::try_from(root_frame).map_err(|_| Error::InvalidPhysicalAddress)?;
     let kernel_address = usize::try_from(kernel_root).map_err(|_| Error::InvalidPhysicalAddress)?;
     // SAFETY: both ranges are aligned live Page Table frames. `root` is exclusively owned.
     unsafe {
@@ -78,10 +79,10 @@ impl UserPageTable {
       );
     }
 
-    let mut owned = [None; MAX_OWNED_PAGE_TABLE_FRAMES];
+    let mut owned = [const { None }; MAX_OWNED_PAGE_TABLE_FRAMES];
     owned[0] = Some(root);
     Ok(Self {
-      root,
+      root_frame,
       owned,
       owned_len: 1,
       mapped_pages: 0,
@@ -89,7 +90,7 @@ impl UserPageTable {
   }
 
   pub const fn root_frame(&self) -> u64 {
-    self.root.start()
+    self.root_frame
   }
 
   pub const fn owned_frames(&self) -> usize {
@@ -111,7 +112,7 @@ impl UserPageTable {
     validate_physical_page(physical_address)?;
 
     let indices = paging::vpn_indices(virtual_address);
-    let root_entry = read_entry(self.root.start(), indices[2])?;
+    let root_entry = read_entry(self.root_frame, indices[2])?;
     if root_entry & PTE_VALID != 0 {
       return Err(if paging::is_leaf(root_entry) {
         Error::LeafWhereTableExpected
@@ -147,7 +148,7 @@ impl UserPageTable {
     )
     .unwrap_or_else(|_| panic!("validated user leaf write failed"));
     write_entry(
-      self.root.start(),
+      self.root_frame,
       indices[2],
       paging::table_pointer(level_one.start()),
     )
@@ -258,16 +259,22 @@ mod tests {
   #[test]
   fn uas_005_owned_frame_slots_match_the_published_count() {
     let root = frame_allocator::frame_block_for_test(0x8000_0000, 1);
-    let mut owned = [None; MAX_OWNED_PAGE_TABLE_FRAMES];
+    let root_frame = root.start();
+    let mut owned = [const { None }; MAX_OWNED_PAGE_TABLE_FRAMES];
     owned[0] = Some(root);
     let table = UserPageTable {
-      root,
+      root_frame,
       owned,
       owned_len: 1,
       mapped_pages: 0,
     };
     assert_eq!(table.owned_frames(), 1);
-    assert_eq!(table.owned[0], Some(root));
+    assert_eq!(
+      table.owned[0]
+        .as_ref()
+        .map(frame_allocator::FrameBlock::start),
+      Some(root_frame)
+    );
   }
 
   #[test]

@@ -32,6 +32,7 @@ pub enum Error {
   ProcessNotAlive,
   Process(crate::process::Error),
   KernelStack(crate::memory::kernel_stack::Error),
+  FrameAllocator(crate::memory::frame_allocator::Error),
   Hart(crate::arch::riscv64::hart::Error),
   KernelAddressSpaceUninitialized,
   RollbackFailed,
@@ -53,6 +54,7 @@ impl Error {
       Self::ProcessNotAlive => "owner process is not alive",
       Self::Process(_) => "process resource accounting failed",
       Self::KernelStack(_) => "kernel stack operation failed",
+      Self::FrameAllocator(_) => "runtime frame allocation failed",
       Self::Hart(_) => "hart-local thread operation failed",
       Self::KernelAddressSpaceUninitialized => "kernel Address Space is not initialized",
       Self::RollbackFailed => "kernel state transaction rollback failed",
@@ -87,6 +89,12 @@ impl From<scheduler::Error> for Error {
 impl From<thread::Error> for Error {
   fn from(error: thread::Error) -> Self {
     Self::Thread(error)
+  }
+}
+
+impl From<crate::memory::frame_allocator::Error> for Error {
+  fn from(error: crate::memory::frame_allocator::Error) -> Self {
+    Self::FrameAllocator(error)
   }
 }
 
@@ -521,6 +529,106 @@ impl KernelState {
     }
   }
 
+  pub fn create_memory_in_space(
+    &mut self,
+    authority_space: CapabilitySpaceId,
+    process_handle: CapabilityHandle,
+    frame: crate::memory::frame_allocator::FrameBlock,
+  ) -> Result<CreatedMemory, CreateMemoryFailure> {
+    match self.create_memory_inner(authority_space, process_handle, frame) {
+      Ok(created) => Ok(created),
+      Err((error, frame)) => Err(CreateMemoryFailure { error, frame }),
+    }
+  }
+
+  fn create_memory_inner(
+    &mut self,
+    authority_space: CapabilitySpaceId,
+    process_handle: CapabilityHandle,
+    frame: crate::memory::frame_allocator::FrameBlock,
+  ) -> Result<CreatedMemory, (Error, crate::memory::frame_allocator::FrameBlock)> {
+    let authority = match self.spaces.get(authority_space) {
+      Ok(space) => space,
+      Err(error) => return Err((Error::CapabilitySpace(error), frame)),
+    };
+    let process_id = match authority.lookup(process_handle, ObjectType::Process, Rights::CREATE) {
+      Ok(id) => id,
+      Err(error) => return Err((Error::Capability(error), frame)),
+    };
+    let process = match self.objects.get(process_id) {
+      Ok(KernelObject::Process(process)) => process,
+      Ok(_) => return Err((Error::Object(object::Error::WrongObjectType), frame)),
+      Err(error) => return Err((Error::Object(error), frame)),
+    };
+    if process.state() != ProcessState::Alive {
+      return Err((Error::ProcessNotAlive, frame));
+    }
+    if let Err(error) = process.can_charge(MEMORY_PAGE_CHARGE) {
+      return Err((Error::Process(error), frame));
+    }
+    let owner_space = process.capability_space();
+
+    if !self.objects.has_free_slot() {
+      return Err((Error::Object(object::Error::TableFull), frame));
+    }
+    let owner_capabilities = match self.spaces.get(owner_space) {
+      Ok(space) => space,
+      Err(error) => return Err((Error::CapabilitySpace(error), frame)),
+    };
+    if !owner_capabilities.has_free_slot() {
+      return Err((
+        Error::Capability(crate::capability::Error::SpaceFull),
+        frame,
+      ));
+    }
+    let node = match self.next_node() {
+      Ok(node) => node,
+      Err(error) => return Err((error, frame)),
+    };
+    if self.next_capability_node.checked_add(1).is_none() {
+      return Err((Error::NodeExhausted, frame));
+    }
+    if frame.start() == 0
+      || !frame.start().is_multiple_of(crate::memory::PAGE_SIZE)
+      || frame.frames() != 1
+    {
+      return Err((Error::Object(object::Error::InvalidMemoryFrame), frame));
+    }
+    let memory = crate::object::MemoryObject::new(frame)
+      .unwrap_or_else(|_| panic!("preflighted runtime frame block became invalid"));
+
+    self
+      .objects
+      .get_mut(process_id)
+      .unwrap_or_else(|_| panic!("preflighted owner process disappeared"))
+      .as_process_mut()
+      .unwrap_or_else(|| panic!("preflighted owner object changed type"))
+      .charge(MEMORY_PAGE_CHARGE)
+      .unwrap_or_else(|_| panic!("preflighted page quota commit failed"));
+    let memory_id = self
+      .objects
+      .insert(KernelObject::Memory(memory))
+      .unwrap_or_else(|_| panic!("preflighted Memory Object insertion failed"));
+    let handle = self
+      .spaces
+      .get_mut(owner_space)
+      .unwrap_or_else(|_| panic!("preflighted owner Capability Space disappeared"))
+      .insert_initial(memory_id, ObjectType::Memory, MEMORY_OWNER_RIGHTS, node)
+      .unwrap_or_else(|_| panic!("preflighted Memory capability insertion failed"));
+    self
+      .objects
+      .add_capability_reference(memory_id)
+      .unwrap_or_else(|_| panic!("new Memory Object reference increment failed"));
+    self
+      .commit_node()
+      .unwrap_or_else(|_| panic!("preflighted node commit failed"));
+
+    Ok(CreatedMemory {
+      object: memory_id,
+      capability: handle,
+    })
+  }
+
   fn create_thread_inner(
     &mut self,
     authority_space: CapabilitySpaceId,
@@ -868,6 +976,16 @@ const THREAD_OWNER_RIGHTS: Rights = Rights::READ
   .union(Rights::REVOKE)
   .union(Rights::DESTROY);
 
+const MEMORY_OWNER_RIGHTS: Rights = Rights::READ
+  .union(Rights::WRITE)
+  .union(Rights::EXECUTE)
+  .union(Rights::MAP)
+  .union(Rights::SHARE)
+  .union(Rights::TRANSFER)
+  .union(Rights::GRANT)
+  .union(Rights::REVOKE)
+  .union(Rights::DESTROY);
+
 const BOOTSTRAP_PROCESS_RIGHTS: Rights = Rights::READ
   .union(Rights::WRITE)
   .union(Rights::TRANSFER)
@@ -882,6 +1000,34 @@ const THREAD_CHARGE: ResourceCharge = ResourceCharge {
   capability_slots: 1,
   ipc_queue_capacity: 0,
 };
+
+const MEMORY_PAGE_CHARGE: ResourceCharge = ResourceCharge {
+  threads: 0,
+  pages: 1,
+  capability_slots: 1,
+  ipc_queue_capacity: 0,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreatedMemory {
+  pub object: ObjectId,
+  pub capability: CapabilityHandle,
+}
+
+pub struct CreateMemoryFailure {
+  error: Error,
+  frame: crate::memory::frame_allocator::FrameBlock,
+}
+
+impl CreateMemoryFailure {
+  pub const fn error(&self) -> Error {
+    self.error
+  }
+
+  pub fn into_parts(self) -> (Error, crate::memory::frame_allocator::FrameBlock) {
+    (self.error, self.frame)
+  }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CreatedThread {
@@ -993,6 +1139,27 @@ pub fn create_thread(
       stack
         .release()
         .unwrap_or_else(|_| panic!("failed Thread creation stack release"));
+      Err(error)
+    }
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn create_memory(
+  authority_space: CapabilitySpaceId,
+  process_handle: CapabilityHandle,
+) -> Result<CreatedMemory, Error> {
+  let frame = crate::memory::frame_allocator::allocate(1)?;
+  let result = {
+    let mut state = KERNEL_STATE.lock();
+    state.create_memory_in_space(authority_space, process_handle, frame)
+  };
+  match result {
+    Ok(created) => Ok(created),
+    Err(failure) => {
+      let (error, frame) = failure.into_parts();
+      crate::memory::frame_allocator::release(frame)
+        .unwrap_or_else(|_| panic!("failed Memory creation frame release"));
       Err(error)
     }
   }
@@ -1165,14 +1332,14 @@ pub fn yield_current_thread() {
 #[cfg(test)]
 mod tests {
   use crate::memory::address_space::{AddressSpace, Asid};
-  use crate::object::MemoryObject;
+  use crate::object::memory_object_for_test;
   use crate::process::{Process, ProcessLimits};
   use crate::thread::{Thread, ThreadState};
 
   use super::*;
 
   fn memory() -> KernelObject {
-    KernelObject::Memory(MemoryObject::new(0x8080_0000).unwrap())
+    KernelObject::Memory(memory_object_for_test(0x8080_0000))
   }
 
   fn initialize_thread_creation_state(
@@ -1188,6 +1355,33 @@ mod tests {
     process.start().unwrap();
     let handle = state
       .create_object_with_capability(KernelObject::Process(process), Rights::CREATE)
+      .unwrap();
+    (handle, owner_space)
+  }
+
+  fn initialize_memory_creation_state(
+    state: &mut KernelState,
+    max_pages: u32,
+    used_pages: u32,
+    rights: Rights,
+  ) -> (CapabilityHandle, CapabilitySpaceId) {
+    let owner_space = state.create_capability_space().unwrap();
+    let mut process = Process::new(
+      ObjectId::from_raw_parts(81, 1),
+      owner_space,
+      ProcessLimits::new(4, max_pages, 8, 8).unwrap(),
+    );
+    process.start().unwrap();
+    for _ in 0..used_pages {
+      process
+        .charge(ResourceCharge {
+          pages: 1,
+          ..ResourceCharge::default()
+        })
+        .unwrap();
+    }
+    let handle = state
+      .create_object_with_capability(KernelObject::Process(process), rights)
       .unwrap();
     (handle, owner_space)
   }
@@ -1741,6 +1935,77 @@ mod tests {
         .state(),
       ThreadState::New
     );
+  }
+
+  #[test]
+  fn memory_create_001_commits_quota_object_and_capability_together() {
+    let mut state = KernelState::new();
+    let bootstrap = state.bootstrap_space();
+    let (process, owner_space) = initialize_memory_creation_state(&mut state, 4, 0, Rights::CREATE);
+    let before_objects = state.object_count();
+    let before_capabilities = state.spaces.get(owner_space).unwrap().live_count();
+    let frame = crate::memory::frame_allocator::frame_block_for_test(0x9000_0000, 1);
+
+    let created = state
+      .create_memory_in_space(bootstrap, process, frame)
+      .unwrap_or_else(|_| panic!("Memory Object creation failed"));
+
+    assert_eq!(state.object_count(), before_objects + 1);
+    assert_eq!(
+      state.spaces.get(owner_space).unwrap().live_count(),
+      before_capabilities + 1
+    );
+    assert!(matches!(
+      state.lookup_in_space(
+        owner_space,
+        created.capability,
+        ObjectType::Memory,
+        Rights::MAP
+      ),
+      Ok(KernelObject::Memory(memory)) if memory.frame_start() == 0x9000_0000
+    ));
+  }
+
+  #[test]
+  fn memory_create_002_quota_failure_returns_frame_without_partial_state() {
+    let mut state = KernelState::new();
+    let bootstrap = state.bootstrap_space();
+    let (process, owner_space) = initialize_memory_creation_state(&mut state, 1, 1, Rights::CREATE);
+    let before = (
+      state.object_count(),
+      state.spaces.get(owner_space).unwrap().live_count(),
+    );
+    let frame = crate::memory::frame_allocator::frame_block_for_test(0x9000_0000, 1);
+
+    let failure = state
+      .create_memory_in_space(bootstrap, process, frame)
+      .err()
+      .unwrap_or_else(|| panic!("page quota accepted Memory Object creation"));
+    let (error, frame) = failure.into_parts();
+
+    assert_eq!(error, Error::Process(crate::process::Error::ResourceLimit));
+    assert_eq!(frame.start(), 0x9000_0000);
+    assert_eq!(
+      (
+        state.object_count(),
+        state.spaces.get(owner_space).unwrap().live_count(),
+      ),
+      before
+    );
+  }
+
+  #[test]
+  fn memory_create_003_create_right_is_required() {
+    let mut state = KernelState::new();
+    let bootstrap = state.bootstrap_space();
+    let (process_without_create, _) =
+      initialize_memory_creation_state(&mut state, 4, 0, Rights::READ);
+    let frame = crate::memory::frame_allocator::frame_block_for_test(0x9000_0000, 1);
+    let failure = state
+      .create_memory_in_space(bootstrap, process_without_create, frame)
+      .err()
+      .unwrap_or_else(|| panic!("missing CREATE accepted Memory Object creation"));
+    assert!(matches!(failure.error(), Error::Capability(_)));
   }
 
   #[test]

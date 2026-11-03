@@ -26,3 +26,15 @@ class KernelObjectTests(QemuTestCase):
             self.output.index(SUCCESS_MARKER),
         )
         self.assertNotIn("[Boot Failure]", self.output)
+
+    def test_object_q004_owned_memory_object_is_published(self) -> None:
+        self.assertIn("[Owned Memory Object]", self.output)
+        self.assertRegex(self.output, r"Page count\s+: 0x0*1")
+        self.assertIn("Allocation        : zero-filled runtime frame", self.output)
+        self.assertIn("Ownership         : Memory Object", self.output)
+        self.assertIn("Process quota     : charged", self.output)
+
+    def test_object_q005_memory_object_precedes_thread_dispatch(self) -> None:
+        memory = self.output.index("[Owned Memory Object]")
+        thread = self.output.index("[Kernel Thread Dispatch]")
+        self.assertLess(memory, thread)
