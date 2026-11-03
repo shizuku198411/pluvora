@@ -79,6 +79,10 @@ impl SavedContext {
       s: [0; 12],
     })
   }
+
+  pub const fn stack_pointer(&self) -> usize {
+    self.sp
+  }
 }
 
 fn validate_trap_frame(frame: usize) -> Result<(), Error> {
@@ -137,6 +141,16 @@ pub(crate) unsafe fn switch_to_thread(outgoing: *mut SavedContext, incoming: *co
 }
 
 #[cfg(target_arch = "riscv64")]
+pub(crate) unsafe fn switch_to_user(outgoing: *mut SavedContext, incoming: *const SavedContext) {
+  assert!(!outgoing.is_null(), "outgoing context pointer is null");
+  assert!(!incoming.is_null(), "incoming context pointer is null");
+  assert_ne!(outgoing.cast_const(), incoming, "context pointers alias");
+  // SAFETY: caller owns both contexts and keeps SIE masked until the incoming
+  // TrapFrame performs SRET. SPIE enables interrupts only after U-mode entry.
+  unsafe { switch_context_to_user(outgoing, incoming) };
+}
+
+#[cfg(target_arch = "riscv64")]
 pub(crate) unsafe fn restore_scheduler_context(hart: usize) -> ! {
   let scheduler =
     scheduler_context(hart).unwrap_or_else(|_| panic!("scheduler context is unavailable"));
@@ -148,6 +162,7 @@ pub(crate) unsafe fn restore_scheduler_context(hart: usize) -> ! {
 unsafe extern "C" {
   fn switch_context(old: *mut SavedContext, new: *const SavedContext);
   fn switch_context_to_thread(old: *mut SavedContext, new: *const SavedContext);
+  fn switch_context_to_user(old: *mut SavedContext, new: *const SavedContext);
   fn restore_context(new: *const SavedContext) -> !;
   fn resume_trap_context() -> !;
 }

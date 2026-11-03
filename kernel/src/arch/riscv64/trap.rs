@@ -43,6 +43,7 @@ pub enum PrivilegeMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundaryError {
   InvalidKernelStack,
+  InvalidKernelThreadPointer,
   ScratchNotClear,
 }
 
@@ -50,6 +51,7 @@ impl BoundaryError {
   pub const fn as_str(self) -> &'static str {
     match self {
       Self::InvalidKernelStack => "user trap kernel stack is invalid",
+      Self::InvalidKernelThreadPointer => "user trap kernel tp is invalid",
       Self::ScratchNotClear => "S-mode sscratch invariant is not clear",
     }
   }
@@ -59,6 +61,7 @@ impl BoundaryError {
 pub enum UserContextError {
   InvalidEntry,
   InvalidStackPointer,
+  InvalidRegister,
 }
 
 impl UserContextError {
@@ -66,6 +69,7 @@ impl UserContextError {
     match self {
       Self::InvalidEntry => "invalid user entry address",
       Self::InvalidStackPointer => "invalid user stack pointer",
+      Self::InvalidRegister => "invalid user register index",
     }
   }
 }
@@ -77,6 +81,8 @@ pub struct TrapFrame {
   sepc: usize,
   scause: usize,
   stval: usize,
+  kernel_tp: usize,
+  kernel_stack_top: usize,
 }
 
 impl TrapFrame {
@@ -99,7 +105,70 @@ impl TrapFrame {
       sepc: entry,
       scause: 0,
       stval: 0,
+      kernel_tp: 0,
+      kernel_stack_top: 0,
     })
+  }
+
+  pub(crate) fn prepare_user_dispatch(
+    &mut self,
+    kernel_tp: usize,
+    kernel_stack_top: usize,
+  ) -> Result<(), BoundaryError> {
+    if kernel_tp == 0 {
+      return Err(BoundaryError::InvalidKernelThreadPointer);
+    }
+    validate_kernel_stack_top(kernel_stack_top)?;
+    self.kernel_tp = kernel_tp;
+    self.kernel_stack_top = kernel_stack_top;
+    Ok(())
+  }
+
+  pub const fn kernel_tp(&self) -> usize {
+    self.kernel_tp
+  }
+
+  pub const fn kernel_stack_top(&self) -> usize {
+    self.kernel_stack_top
+  }
+
+  pub const fn register(&self, index: usize) -> Option<usize> {
+    if index < self.registers.len() {
+      Some(self.registers[index])
+    } else {
+      None
+    }
+  }
+
+  pub fn set_register(&mut self, index: usize, value: usize) -> Result<(), UserContextError> {
+    if index == 0 || index >= self.registers.len() {
+      return Err(UserContextError::InvalidRegister);
+    }
+    self.registers[index] = value;
+    Ok(())
+  }
+
+  pub const fn user_syscall(&self) -> UserSyscall {
+    match self.registers[17] {
+      crate::user_image::EXIT_SYSCALL => UserSyscall::Exit {
+        status: self.registers[10],
+      },
+      crate::user_image::YIELD_SYSCALL => UserSyscall::Yield,
+      number => UserSyscall::Unknown { number },
+    }
+  }
+
+  pub fn complete_yield_syscall(&mut self) -> Result<(), UserContextError> {
+    let next = self
+      .sepc
+      .checked_add(4)
+      .ok_or(UserContextError::InvalidEntry)?;
+    if !crate::arch::riscv64::paging::is_sv39_address(next as u64) {
+      return Err(UserContextError::InvalidEntry);
+    }
+    self.registers[10] = 0;
+    self.sepc = next;
+    Ok(())
   }
 
   pub const fn privilege_mode(&self) -> PrivilegeMode {
@@ -136,12 +205,14 @@ impl TrapFrame {
 }
 
 const _: () = {
-  assert!(size_of::<TrapFrame>() == 36 * size_of::<usize>());
+  assert!(size_of::<TrapFrame>() == 38 * size_of::<usize>());
   assert!(offset_of!(TrapFrame, registers) == 0);
   assert!(offset_of!(TrapFrame, sstatus) == 32 * size_of::<usize>());
   assert!(offset_of!(TrapFrame, sepc) == 33 * size_of::<usize>());
   assert!(offset_of!(TrapFrame, scause) == 34 * size_of::<usize>());
   assert!(offset_of!(TrapFrame, stval) == 35 * size_of::<usize>());
+  assert!(offset_of!(TrapFrame, kernel_tp) == 36 * size_of::<usize>());
+  assert!(offset_of!(TrapFrame, kernel_stack_top) == 37 * size_of::<usize>());
 };
 
 const fn initial_user_sstatus() -> usize {
@@ -196,13 +267,13 @@ pub enum Exception {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserExceptionAction {
-  ExitRequested,
+  Syscall,
   TerminateFault,
 }
 
 pub const fn user_exception_action(exception: Exception) -> UserExceptionAction {
   match exception {
-    Exception::UserEnvironmentCall => UserExceptionAction::ExitRequested,
+    Exception::UserEnvironmentCall => UserExceptionAction::Syscall,
     Exception::IllegalInstruction
     | Exception::Breakpoint
     | Exception::SupervisorEnvironmentCall
@@ -213,7 +284,27 @@ pub const fn user_exception_action(exception: Exception) -> UserExceptionAction 
   }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserSyscall {
+  Exit { status: usize },
+  Yield,
+  Unknown { number: usize },
+}
+
 impl Exception {
+  pub const fn code(self) -> usize {
+    match self {
+      Self::IllegalInstruction => EXCEPTION_ILLEGAL_INSTRUCTION,
+      Self::Breakpoint => EXCEPTION_BREAKPOINT,
+      Self::UserEnvironmentCall => EXCEPTION_USER_ECALL,
+      Self::SupervisorEnvironmentCall => EXCEPTION_SUPERVISOR_ECALL,
+      Self::InstructionPageFault => EXCEPTION_INSTRUCTION_PAGE_FAULT,
+      Self::LoadPageFault => EXCEPTION_LOAD_PAGE_FAULT,
+      Self::StorePageFault => EXCEPTION_STORE_PAGE_FAULT,
+      Self::Unknown(code) => code,
+    }
+  }
+
   const fn from_code(code: usize) -> Self {
     match code {
       EXCEPTION_ILLEGAL_INSTRUCTION => Self::IllegalInstruction,
@@ -238,6 +329,28 @@ impl Exception {
       Self::StorePageFault => "store/AMO page fault",
       Self::Unknown(_) => "unknown exception",
     }
+  }
+}
+
+pub const fn termination_reason(
+  exception: Exception,
+  sepc: usize,
+  stval: usize,
+) -> crate::process::TerminationReason {
+  use crate::process::TerminationReason;
+  match exception {
+    Exception::IllegalInstruction => TerminationReason::IllegalInstruction { sepc, stval },
+    Exception::Breakpoint => TerminationReason::Breakpoint { sepc },
+    Exception::InstructionPageFault => TerminationReason::InstructionPageFault { sepc, stval },
+    Exception::LoadPageFault => TerminationReason::LoadPageFault { sepc, stval },
+    Exception::StorePageFault => TerminationReason::StorePageFault { sepc, stval },
+    Exception::Unknown(_)
+    | Exception::SupervisorEnvironmentCall
+    | Exception::UserEnvironmentCall => TerminationReason::UnknownException {
+      code: exception.code(),
+      sepc,
+      stval,
+    },
   }
 }
 
@@ -301,7 +414,7 @@ pub fn idle_scratch() -> Result<usize, BoundaryError> {
   Ok(value)
 }
 
-fn validate_kernel_stack_top(kernel_stack_top: usize) -> Result<(), BoundaryError> {
+pub(crate) fn validate_kernel_stack_top(kernel_stack_top: usize) -> Result<(), BoundaryError> {
   if kernel_stack_top == 0
     || !kernel_stack_top.is_multiple_of(crate::arch::riscv64::context::KERNEL_STACK_ALIGNMENT)
   {
@@ -328,7 +441,6 @@ pub(crate) unsafe fn arm_user_trap_stack(kernel_stack_top: usize) -> Result<(), 
 }
 
 #[cfg(target_arch = "riscv64")]
-#[expect(dead_code, reason = "used when user dispatch is enabled")]
 pub(crate) fn disarm_user_trap_stack() {
   // SAFETY: caller has returned to a stable S-mode stack.
   unsafe { asm!("csrw sscratch, zero", options(nostack)) };
@@ -339,11 +451,14 @@ pub(crate) fn disarm_user_trap_stack() {
 extern "C" fn trap_handler(frame: &mut TrapFrame) {
   let cause = Cause::from_scause(frame.scause);
   if frame.is_user_origin() {
-    unexpected_user_trap(frame, cause);
+    return handle_user_trap(frame, cause);
   }
 
   if cause == Cause::Interrupt(Interrupt::SupervisorSoftware) {
     ipi::handle_local();
+    if kernel_state::stop_current_kernel_if_terminating() {
+      unreachable!("terminating kernel join returned");
+    }
     if crate::arch::riscv64::hart::current().reschedule_requested() {
       kernel_state::try_preempt_current_thread(frame);
     }
@@ -352,6 +467,9 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
 
   if cause == Cause::Interrupt(Interrupt::SupervisorTimer) {
     timer::handle_local();
+    if kernel_state::stop_current_kernel_if_terminating() {
+      unreachable!("terminating kernel join returned");
+    }
     kernel_state::try_preempt_current_thread(frame);
     return;
   }
@@ -365,6 +483,72 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
   }
 
   fatal_trap(frame, cause)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn handle_user_trap(frame: &mut TrapFrame, cause: Cause) {
+  match cause {
+    Cause::Exception(Exception::UserEnvironmentCall) => match frame.user_syscall() {
+      UserSyscall::Exit { status } => {
+        kernel_state::terminate_current_process(crate::process::TerminationReason::Exit { status })
+      }
+      UserSyscall::Yield => {
+        frame.complete_yield_syscall().unwrap_or_else(|_| {
+          kernel_state::terminate_current_process(
+            crate::process::TerminationReason::UnknownException {
+              code: EXCEPTION_USER_ECALL,
+              sepc: frame.sepc(),
+              stval: frame.stval(),
+            },
+          )
+        });
+        kernel_state::switch_out_current_user_thread(
+          frame as *mut _,
+          crate::thread::UserSwitchReason::Yield,
+        )
+      }
+      UserSyscall::Unknown { number } => {
+        kernel_state::terminate_current_process(crate::process::TerminationReason::UnknownSyscall {
+          number,
+        })
+      }
+    },
+    Cause::Interrupt(Interrupt::SupervisorTimer) => {
+      timer::handle_local();
+      if kernel_state::stop_current_user_if_terminating() {
+        unreachable!("terminating user join returned");
+      }
+      preempt_user_if_requested(frame);
+    }
+    Cause::Interrupt(Interrupt::SupervisorSoftware) => {
+      ipi::handle_local();
+      if kernel_state::stop_current_user_if_terminating() {
+        unreachable!("terminating user join returned");
+      }
+      preempt_user_if_requested(frame);
+    }
+    Cause::Exception(exception) => kernel_state::terminate_current_process(termination_reason(
+      exception,
+      frame.sepc(),
+      frame.stval(),
+    )),
+    Cause::Interrupt(_) => unexpected_user_trap(frame, cause),
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn preempt_user_if_requested(frame: &mut TrapFrame) {
+  let local = crate::arch::riscv64::hart::current();
+  if !local.reschedule_requested() || !local.can_preempt() {
+    return;
+  }
+  if !local.take_reschedule_request() {
+    panic!("user preemption lost reschedule request");
+  }
+  kernel_state::switch_out_current_user_thread(
+    frame as *mut _,
+    crate::thread::UserSwitchReason::Preempt,
+  )
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -481,12 +665,14 @@ mod tests {
 
   #[test]
   fn trap_010_trap_frame_layout_matches_assembly_abi() {
-    assert_eq!(size_of::<TrapFrame>(), 288);
+    assert_eq!(size_of::<TrapFrame>(), 304);
     assert_eq!(offset_of!(TrapFrame, registers), 0);
     assert_eq!(offset_of!(TrapFrame, sstatus), 32 * 8);
     assert_eq!(offset_of!(TrapFrame, sepc), 33 * 8);
     assert_eq!(offset_of!(TrapFrame, scause), 34 * 8);
     assert_eq!(offset_of!(TrapFrame, stval), 35 * 8);
+    assert_eq!(offset_of!(TrapFrame, kernel_tp), 36 * 8);
+    assert_eq!(offset_of!(TrapFrame, kernel_stack_top), 37 * 8);
   }
 
   #[test]
@@ -564,10 +750,10 @@ mod tests {
   }
 
   #[test]
-  fn trap_016_user_ecall_requests_controlled_exit() {
+  fn trap_016_user_ecall_enters_syscall_dispatch() {
     assert_eq!(
       user_exception_action(Exception::UserEnvironmentCall),
-      UserExceptionAction::ExitRequested
+      UserExceptionAction::Syscall
     );
   }
 
@@ -599,5 +785,92 @@ mod tests {
       Err(BoundaryError::InvalidKernelStack)
     );
     assert_eq!(validate_kernel_stack_top(0x8000), Ok(()));
+  }
+
+  #[test]
+  fn trap_019_user_dispatch_metadata_requires_kernel_tp_and_aligned_stack() {
+    let mut frame = TrapFrame::initial_user(0x1000, 0x4000).unwrap();
+    assert_eq!(
+      frame.prepare_user_dispatch(0, 0x9000),
+      Err(BoundaryError::InvalidKernelThreadPointer)
+    );
+    assert_eq!(
+      frame.prepare_user_dispatch(0x8100_0000, 0x9008),
+      Err(BoundaryError::InvalidKernelStack)
+    );
+    frame.prepare_user_dispatch(0x8100_0000, 0x9000).unwrap();
+    assert_eq!(frame.kernel_tp(), 0x8100_0000);
+    assert_eq!(frame.kernel_stack_top(), 0x9000);
+  }
+
+  #[test]
+  fn trap_020_user_syscall_decodes_exit_yield_and_unknown() {
+    let mut frame = TrapFrame::initial_user(0x1000, 0x4000).unwrap();
+    frame.set_register(10, 7).unwrap();
+    frame
+      .set_register(17, crate::user_image::EXIT_SYSCALL)
+      .unwrap();
+    assert_eq!(frame.user_syscall(), UserSyscall::Exit { status: 7 });
+    frame
+      .set_register(17, crate::user_image::YIELD_SYSCALL)
+      .unwrap();
+    assert_eq!(frame.user_syscall(), UserSyscall::Yield);
+    frame.set_register(17, 99).unwrap();
+    assert_eq!(frame.user_syscall(), UserSyscall::Unknown { number: 99 });
+  }
+
+  #[test]
+  fn trap_021_yield_completion_sets_result_and_advances_sepc() {
+    let mut frame = TrapFrame::initial_user(0x1000, 0x4000).unwrap();
+    frame.set_register(10, usize::MAX).unwrap();
+    frame.complete_yield_syscall().unwrap();
+    assert_eq!(frame.register(10), Some(0));
+    assert_eq!(frame.sepc(), 0x1004);
+  }
+
+  #[test]
+  fn trap_022_register_zero_and_invalid_yield_continuation_are_rejected() {
+    let mut frame = TrapFrame::initial_user(0x1000, 0x4000).unwrap();
+    assert_eq!(
+      frame.set_register(0, 1),
+      Err(UserContextError::InvalidRegister)
+    );
+    assert_eq!(frame.register(32), None);
+    frame.sepc = 0x0000_003f_ffff_fffc;
+    assert_eq!(
+      frame.complete_yield_syscall(),
+      Err(UserContextError::InvalidEntry)
+    );
+  }
+
+  #[test]
+  fn trap_023_user_faults_map_to_typed_termination_reasons() {
+    use crate::process::TerminationReason;
+    assert_eq!(
+      termination_reason(Exception::IllegalInstruction, 0x1000, 0x55),
+      TerminationReason::IllegalInstruction {
+        sepc: 0x1000,
+        stval: 0x55
+      }
+    );
+    assert_eq!(
+      termination_reason(Exception::Breakpoint, 0x2000, 0),
+      TerminationReason::Breakpoint { sepc: 0x2000 }
+    );
+    assert_eq!(
+      termination_reason(Exception::LoadPageFault, 0x3000, 0xdead),
+      TerminationReason::LoadPageFault {
+        sepc: 0x3000,
+        stval: 0xdead
+      }
+    );
+    assert_eq!(
+      termination_reason(Exception::Unknown(63), 0x4000, 0xbeef),
+      TerminationReason::UnknownException {
+        code: 63,
+        sepc: 0x4000,
+        stval: 0xbeef
+      }
+    );
   }
 }

@@ -180,6 +180,10 @@ impl HartLocal {
       .store(usize::from(asid.value()), Ordering::Release);
   }
 
+  pub fn current_asid(&self) -> usize {
+    self.current_asid.load(Ordering::Acquire)
+  }
+
   pub fn has_ipi_requests(&self) -> bool {
     self.pending_ipi_requests.load(Ordering::Acquire) != 0
   }

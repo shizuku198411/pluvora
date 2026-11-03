@@ -400,6 +400,21 @@ pub fn satp_value_for(root_frame: u64, asid: u16) -> Result<u64, Error> {
   Ok((SATP_MODE_SV39 << SATP_MODE_SHIFT) | (u64::from(asid) << SATP_ASID_SHIFT) | root_ppn)
 }
 
+#[cfg(target_arch = "riscv64")]
+pub(crate) unsafe fn activate_dispatch_token(token: crate::memory::address_space::DispatchToken) {
+  let satp = token.satp();
+  // SAFETY: caller validated the transition, owns the current hart with
+  // interrupts masked, and both roots contain the executing kernel mapping.
+  unsafe {
+    asm!(
+      "csrw satp, {satp}",
+      "sfence.vma zero, zero",
+      satp = in(reg) satp,
+      options(nostack),
+    )
+  };
+}
+
 pub fn is_valid_page_address(virtual_address: u64) -> bool {
   virtual_address.is_multiple_of(PAGE_SIZE) && is_sv39_address(virtual_address)
 }

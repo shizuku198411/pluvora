@@ -24,6 +24,22 @@ pub struct Asid {
   generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchToken {
+  satp: u64,
+  asid: Asid,
+}
+
+impl DispatchToken {
+  pub const fn satp(self) -> u64 {
+    self.satp
+  }
+
+  pub const fn asid(self) -> Asid {
+    self.asid
+  }
+}
+
 impl Asid {
   pub const fn kernel() -> Self {
     Self {
@@ -148,6 +164,13 @@ impl AddressSpace {
     self.asid
   }
 
+  pub fn dispatch_token(&self) -> Result<DispatchToken, crate::arch::riscv64::paging::Error> {
+    Ok(DispatchToken {
+      satp: crate::arch::riscv64::paging::satp_value_for(self.root_frame(), self.asid.value())?,
+      asid: self.asid,
+    })
+  }
+
   pub const fn is_user(&self) -> bool {
     matches!(self.kind, AddressSpaceKind::User { .. })
   }
@@ -158,6 +181,26 @@ impl AddressSpace {
 
   pub fn mapping(&self, index: usize) -> Option<&MappingRecord> {
     self.mappings.get(index).and_then(Option::as_ref)
+  }
+
+  pub fn has_initial_user_image(&self) -> bool {
+    if !self.is_user() {
+      return false;
+    }
+    let mut text = false;
+    let mut stack = false;
+    for mapping in self.mappings[..self.mapping_len].iter().flatten() {
+      match (mapping.virtual_address(), mapping.permissions()) {
+        (crate::memory::user_page_table::USER_TEXT_BASE, UserPermissions::ReadExecute) => {
+          text = true
+        }
+        (crate::memory::user_page_table::USER_STACK_BASE, UserPermissions::ReadWrite) => {
+          stack = true
+        }
+        _ => {}
+      }
+    }
+    text && stack
   }
 
   #[cfg(target_arch = "riscv64")]
@@ -385,5 +428,29 @@ mod tests {
   #[test]
   fn aspace_006_initial_user_image_capacity_is_two_mappings() {
     assert_eq!(MAX_USER_MAPPINGS, 2);
+  }
+
+  #[test]
+  fn aspace_007_dispatch_token_encodes_root_and_asid() {
+    let mut state = AsidState::new(2);
+    let asid = state.allocate_without_rollover().unwrap();
+    let space = AddressSpace::new(0x8020_0000, asid).unwrap();
+    let token = space.dispatch_token().unwrap();
+    assert_eq!(token.asid(), asid);
+    assert_eq!(
+      token.satp(),
+      crate::arch::riscv64::paging::satp_value_for(0x8020_0000, 1).unwrap()
+    );
+  }
+
+  #[test]
+  fn aspace_008_kernel_dispatch_token_uses_asid_zero() {
+    let space = AddressSpace::new(0x8020_0000, Asid::kernel()).unwrap();
+    let token = space.dispatch_token().unwrap();
+    assert_eq!(token.asid(), Asid::kernel());
+    assert_eq!(
+      token.satp(),
+      crate::arch::riscv64::paging::satp_value_for(0x8020_0000, 0).unwrap()
+    );
   }
 }

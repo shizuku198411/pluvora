@@ -30,7 +30,21 @@ pub enum Error {
   InvalidState,
   ExecutionAlreadyInstalled,
   ExecutionMissing,
+  InvalidUserContext,
+  CounterOverflow,
   Context(context::Error),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionKind {
+  Kernel,
+  User,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserSwitchReason {
+  Yield,
+  Preempt,
 }
 
 pub struct Thread {
@@ -41,6 +55,8 @@ pub struct Thread {
   base_priority: u8,
   effective_priority: u8,
   running_hart: Option<u16>,
+  user_yields: u64,
+  user_preemptions: u64,
 }
 
 impl Thread {
@@ -55,6 +71,8 @@ impl Thread {
       base_priority: priority,
       effective_priority: priority,
       running_hart: None,
+      user_yields: 0,
+      user_preemptions: 0,
     })
   }
 
@@ -80,6 +98,32 @@ impl Thread {
 
   pub const fn running_hart(&self) -> Option<u16> {
     self.running_hart
+  }
+
+  pub const fn user_yields(&self) -> u64 {
+    self.user_yields
+  }
+
+  pub const fn user_preemptions(&self) -> u64 {
+    self.user_preemptions
+  }
+
+  pub(crate) fn record_user_switch(&mut self, reason: UserSwitchReason) -> Result<(), Error> {
+    match reason {
+      UserSwitchReason::Yield => {
+        self.user_yields = self
+          .user_yields
+          .checked_add(1)
+          .ok_or(Error::CounterOverflow)?;
+      }
+      UserSwitchReason::Preempt => {
+        self.user_preemptions = self
+          .user_preemptions
+          .checked_add(1)
+          .ok_or(Error::CounterOverflow)?;
+      }
+    }
+    Ok(())
   }
 
   pub fn allows_hart(&self, index: usize) -> Result<bool, Error> {
@@ -154,6 +198,16 @@ impl Thread {
     Ok(())
   }
 
+  #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+  pub(crate) fn stop_for_termination(&mut self) -> Result<(), Error> {
+    if self.state == ThreadState::Stopped {
+      return Err(Error::InvalidState);
+    }
+    self.state = ThreadState::Stopped;
+    self.running_hart = None;
+    Ok(())
+  }
+
   pub fn set_effective_priority(&mut self, priority: u8) -> Result<(), Error> {
     validate_priority(priority)?;
     if priority < self.base_priority {
@@ -190,6 +244,68 @@ impl Thread {
     self.execution = Some(ThreadExecution {
       context,
       kernel_stack: stack,
+      kind: ExecutionKind::Kernel,
+    });
+    Ok(())
+  }
+
+  #[cfg(target_arch = "riscv64")]
+  pub fn install_user_execution(
+    &mut self,
+    stack: KernelStack,
+    entry: usize,
+    user_stack_top: usize,
+  ) -> Result<(), InstallExecutionError> {
+    use core::mem::size_of;
+
+    use crate::arch::riscv64::trap::TrapFrame;
+
+    if self.execution.is_some() {
+      return Err(InstallExecutionError {
+        error: Error::ExecutionAlreadyInstalled,
+        stack,
+      });
+    }
+    let frame_address = match stack.top().checked_sub(size_of::<TrapFrame>()) {
+      Some(address)
+        if address >= stack.base() as usize
+          && address.is_multiple_of(context::KERNEL_STACK_ALIGNMENT) =>
+      {
+        address
+      }
+      _ => {
+        return Err(InstallExecutionError {
+          error: Error::Context(context::Error::InvalidTrapFrame),
+          stack,
+        });
+      }
+    };
+    let frame = match TrapFrame::initial_user(entry, user_stack_top) {
+      Ok(frame) => frame,
+      Err(_) => {
+        return Err(InstallExecutionError {
+          error: Error::InvalidUserContext,
+          stack,
+        });
+      }
+    };
+    let context = match SavedContext::trap_resume(frame_address) {
+      Ok(context) => context,
+      Err(error) => {
+        return Err(InstallExecutionError {
+          error: Error::Context(error),
+          stack,
+        });
+      }
+    };
+
+    // SAFETY: the owned KernelStack is live identity-mapped RAM and the frame
+    // is aligned and fully contained before this New Thread is published.
+    unsafe { (frame_address as *mut TrapFrame).write(frame) };
+    self.execution = Some(ThreadExecution {
+      context,
+      kernel_stack: stack,
+      kind: ExecutionKind::User,
     });
     Ok(())
   }
@@ -214,15 +330,40 @@ impl Thread {
 pub struct ThreadExecution {
   context: SavedContext,
   kernel_stack: KernelStack,
+  kind: ExecutionKind,
 }
 
 impl ThreadExecution {
+  pub const fn kind(&self) -> ExecutionKind {
+    self.kind
+  }
+
   pub const fn context(&self) -> &SavedContext {
     &self.context
   }
 
   pub fn context_mut(&mut self) -> &mut SavedContext {
     &mut self.context
+  }
+
+  #[cfg(target_arch = "riscv64")]
+  pub(crate) fn prepare_user_dispatch(
+    &mut self,
+    kernel_tp: usize,
+  ) -> Result<usize, crate::arch::riscv64::trap::BoundaryError> {
+    if self.kind != ExecutionKind::User {
+      return Err(crate::arch::riscv64::trap::BoundaryError::InvalidKernelStack);
+    }
+    let kernel_stack_top = self.kernel_stack.top();
+    let frame_address = self.context.stack_pointer();
+    let frame = frame_address as *mut crate::arch::riscv64::trap::TrapFrame;
+    if frame.is_null() {
+      return Err(crate::arch::riscv64::trap::BoundaryError::InvalidKernelStack);
+    }
+    // SAFETY: User Thread execution owns this live TrapFrame for its lifetime;
+    // KERNEL_STATE serializes metadata updates before dispatch publication.
+    unsafe { &mut *frame }.prepare_user_dispatch(kernel_tp, kernel_stack_top)?;
+    Ok(kernel_stack_top)
   }
 
   pub const fn kernel_stack(&self) -> &KernelStack {
@@ -420,5 +561,42 @@ mod tests {
     assert_eq!(thread.make_runnable(), Err(Error::InvalidState));
     assert_eq!(thread.stop(), Err(Error::InvalidState));
     assert_eq!(thread.state(), ThreadState::Switching);
+  }
+
+  #[test]
+  fn thread_013_user_switch_counters_are_independent() {
+    let mut thread = thread();
+    thread.record_user_switch(UserSwitchReason::Yield).unwrap();
+    thread.record_user_switch(UserSwitchReason::Yield).unwrap();
+    thread
+      .record_user_switch(UserSwitchReason::Preempt)
+      .unwrap();
+    assert_eq!(thread.user_yields(), 2);
+    assert_eq!(thread.user_preemptions(), 1);
+    assert_eq!(thread.state(), ThreadState::New);
+  }
+
+  #[test]
+  fn thread_014_user_switch_counter_rejects_overflow() {
+    let mut thread = thread();
+    thread.user_yields = u64::MAX;
+    assert_eq!(
+      thread.record_user_switch(UserSwitchReason::Yield),
+      Err(Error::CounterOverflow)
+    );
+    assert_eq!(thread.user_yields(), u64::MAX);
+    assert_eq!(thread.user_preemptions(), 0);
+  }
+
+  #[test]
+  fn thread_015_termination_can_stop_switching_thread() {
+    let mut thread = thread();
+    thread.make_runnable().unwrap();
+    thread.begin_running(0).unwrap();
+    thread.begin_switch_out().unwrap();
+    thread.stop_for_termination().unwrap();
+    assert_eq!(thread.state(), ThreadState::Stopped);
+    assert_eq!(thread.running_hart(), None);
+    assert_eq!(thread.stop_for_termination(), Err(Error::InvalidState));
   }
 }

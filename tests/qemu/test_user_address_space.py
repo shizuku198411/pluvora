@@ -51,3 +51,62 @@ class UserAddressSpaceTests(QemuTestCase):
         self.assertIsNotNone(text)
         self.assertIsNotNone(stack)
         self.assertNotEqual(text.group(1), stack.group(1))
+
+    def test_uas_q011_user_mode_dispatch_returns_through_ecall(self) -> None:
+        self.assertIn("[User-mode Dispatch]", self.output)
+        self.assertIn("U-mode entered    : yes", self.output)
+        self.assertIn("Exit mechanism    : user ecall", self.output)
+        self.assertIn("Final state       : Stopped", self.output)
+        self.assertIn("Kernel return     : verified", self.output)
+
+    def test_uas_q012_user_address_space_is_inactive_but_resident_after_exit(
+        self,
+    ) -> None:
+        active = re.search(r"Active hart mask\s*: (0x[0-9a-f]+)", self.output)
+        resident = re.search(r"Resident hart mask\s*: (0x[0-9a-f]+)", self.output)
+        current_asid = re.search(r"Current ASID\s*: (0x[0-9a-f]+)", self.output)
+        self.assertIsNotNone(active)
+        self.assertIsNotNone(resident)
+        self.assertIsNotNone(current_asid)
+        self.assertEqual(int(active.group(1), 16), 0)
+        resident_mask = int(resident.group(1), 16)
+        self.assertNotEqual(resident_mask, 0)
+        self.assertEqual(resident_mask & (resident_mask - 1), 0)
+        self.assertEqual(int(current_asid.group(1), 16), 0)
+
+    def test_uas_q013_user_dispatch_has_no_unexpected_or_fatal_trap(self) -> None:
+        self.assertNotIn("[Unexpected U-mode Trap]", self.output)
+        self.assertNotIn("[Fatal S-mode Trap]", self.output)
+        self.assertNotIn("[PANIC]", self.output)
+
+    def test_uas_q014_two_user_threads_yield_and_exit(self) -> None:
+        self.assertIn("[User Scheduling]", self.output)
+        self.assertRegex(self.output, r"User threads\s*: 0x0*2")
+        self.assertRegex(self.output, r"Completed yields\s*: 0x0*6")
+        self.assertIn("Same Process/AS   : verified", self.output)
+        self.assertIn("Round robin       : verified", self.output)
+        self.assertIn("Final states      : Stopped / Stopped", self.output)
+
+    def test_uas_q015_user_switches_leave_no_running_publication(self) -> None:
+        scheduling = self.output[self.output.index("[User Scheduling]") :]
+        self.assertRegex(scheduling, r"Runnable threads\s*: 0x0+")
+        self.assertRegex(scheduling, r"Running threads\s*: 0x0+")
+        self.assertRegex(scheduling, r"Active hart mask\s*: 0x0+")
+
+    def test_uas_q016_repeated_user_dispatch_has_no_fatal_path(self) -> None:
+        self.assertNotIn("[Unexpected U-mode Trap]", self.output)
+        self.assertNotIn("[Fatal S-mode Trap]", self.output)
+        self.assertNotIn("[PANIC]", self.output)
+
+    def test_uas_q017_user_exit_reaches_quiescent_stopping_state(self) -> None:
+        self.assertIn("[Process Termination]", self.output)
+        self.assertIn("Reason            : exit", self.output)
+        self.assertIn("Process state     : Stopping", self.output)
+        self.assertIn("Progress          : Quiescent", self.output)
+        self.assertRegex(self.output, r"Live threads\s+: 0x0+")
+        self.assertRegex(self.output, r"Active hart mask\s+: 0x0+")
+
+    def test_uas_q018_termination_does_not_panic(self) -> None:
+        self.assertNotIn("[Unexpected U-mode Trap]", self.output)
+        self.assertNotIn("[Fatal S-mode Trap]", self.output)
+        self.assertNotIn("[PANIC]", self.output)

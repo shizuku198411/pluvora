@@ -16,6 +16,7 @@ pub mod process;
 pub mod scheduler;
 pub mod sync;
 pub mod thread;
+pub mod user_image;
 
 #[cfg(target_arch = "riscv64")]
 pub mod boot;

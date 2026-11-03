@@ -134,6 +134,16 @@ pub fn memory_object(object: crate::object::ObjectId, capability: CapabilityHand
   console::write_line("  Process quota     : charged");
 }
 
+pub fn initialized_user_image(image: crate::kernel_state::InitializedUserImage) {
+  section("Initial User Image");
+  usize_field("Text memory", image.memory.into_raw());
+  usize_field("Image bytes", image.bytes);
+  console::write_line("  Remaining bytes   : zero-filled");
+  console::write_line("  Publication order : write-before-execute");
+  console::write_line("  Local FENCE.I     : complete");
+  console::write_line("  Remote FENCE.I    : required on first dispatch");
+}
+
 pub fn user_image(
   text: crate::kernel_state::MappedMemory,
   stack: crate::kernel_state::MappedMemory,
@@ -156,6 +166,61 @@ pub fn user_image(
   console::write_line("  Guard mapping     : absent");
   console::write_line("  Mapping references: two held");
   console::write_line("  Shared PT path    : verified");
+}
+
+pub fn prepared_user_thread(
+  attached: crate::kernel_state::AttachedAddressSpace,
+  thread: crate::kernel_state::PreparedUserThread,
+) {
+  section("User Process");
+  usize_field("Address Space", attached.current.into_raw());
+  usize_field("Prepared Thread", thread.object.into_raw());
+  console::write_line("  Thread state      : New");
+  console::write_line("  Execution mode    : User");
+}
+
+pub fn user_dispatch(summary: crate::kernel_state::UserDispatchSummary) {
+  section("User-mode Dispatch");
+  usize_field("Thread", summary.thread.into_raw());
+  console::write_line("  U-mode entered    : yes");
+  console::write_line("  Exit mechanism    : user ecall");
+  console::write_line("  Final state       : Stopped");
+  u64_field("Active hart mask", summary.active_harts);
+  u64_field("Resident hart mask", summary.resident_harts);
+  usize_field("Current ASID", summary.current_asid);
+  console::write_line("  Kernel return     : verified");
+}
+
+pub fn user_scheduling(summary: crate::kernel_state::UserPairSummary, dispatches: usize) {
+  section("User Scheduling");
+  usize_field("User threads", 2);
+  usize_field("Dispatches", dispatches);
+  u64_field("Completed yields", summary.total_yields);
+  u64_field("Timer/IPI preemptions", summary.total_preemptions);
+  console::write_line("  Same Process/AS   : verified");
+  console::write_line("  Round robin       : verified");
+  console::write_line("  Final states      : Stopped / Stopped");
+  usize_field("Runnable threads", summary.runnable);
+  usize_field("Running threads", summary.running);
+  u64_field("Active hart mask", summary.active_harts);
+}
+
+pub fn process_termination(summary: crate::kernel_state::TerminationSummary) {
+  section("Process Termination");
+  console::write("  Reason            : ");
+  console::write_line(summary.reason.name());
+  console::write_line("  Process state     : Stopping");
+  console::write("  Progress          : ");
+  console::write_line(match summary.progress {
+    crate::process::TerminationProgress::Pending => "Pending",
+    crate::process::TerminationProgress::Quiescent => "Quiescent",
+  });
+  usize_field("Stopped threads", summary.stopped_threads);
+  usize_field("Live threads", summary.live_threads);
+  u64_field("Active hart mask", summary.active_harts);
+  console::write_line("  Death notification: pending IPC endpoint");
+  console::write_line("  Reclamation       : pending revocation/unmap");
+  console::write_line("  Dead transition   : correctly deferred");
 }
 
 pub fn runtime_memory(free_frames: usize, stack_top: usize) {

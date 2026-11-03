@@ -5,7 +5,7 @@
 .type resume_trap_context, @function
 .align 2
 
-.equ TRAP_FRAME_SIZE, 288
+.equ TRAP_FRAME_SIZE, 304
 .equ SSTATUS_SPP, 1 << 8
 
 trap_entry:
@@ -21,6 +21,8 @@ trap_entry:
   sd      t0, 5 * 8(sp)
   addi    t0, sp, TRAP_FRAME_SIZE
   sd      t0, 2 * 8(sp)
+  sd      tp, 4 * 8(sp)
+  sd      t1, 6 * 8(sp)
   j       .Ltrap_stack_ready
 
 .Ltrap_from_user:
@@ -29,16 +31,26 @@ trap_entry:
   # S-mode traps continue to use their current kernel sp.
   addi    sp, sp, -TRAP_FRAME_SIZE
   sd      t0, 5 * 8(sp)
+  sd      tp, 4 * 8(sp)
+  sd      t1, 6 * 8(sp)
   csrr    t0, sscratch
   sd      t0, 2 * 8(sp)
   csrw    sscratch, zero
+  ld      tp, 36 * 8(sp)
+  beqz    tp, .Linvalid_user_metadata
+  ld      t0, 37 * 8(sp)
+  addi    t1, sp, TRAP_FRAME_SIZE
+  bne     t0, t1, .Linvalid_user_metadata
+  j       .Ltrap_stack_ready
+
+.Linvalid_user_metadata:
+  # There is no trusted kernel tp, so Rust diagnostics are unsafe.
+  j       .Linvalid_user_metadata
 
 .Ltrap_stack_ready:
   sd    zero, 0 * 8(sp)
   sd    ra,   1 * 8(sp)
   sd    gp,   3 * 8(sp)
-  sd    tp,   4 * 8(sp)
-  sd    t1,   6 * 8(sp)
   sd    t2,   7 * 8(sp)
   sd    s0,   8 * 8(sp)
   sd    s1,   9 * 8(sp)
@@ -87,7 +99,8 @@ resume_trap_context:
   bnez  t2, .Lresume_supervisor
 
   # U-return: re-arm the kernel stack top for the next user trap.
-  addi  t2, sp, TRAP_FRAME_SIZE
+  ld    t2, 37 * 8(sp)
+  beqz  t2, .Linvalid_user_metadata
   csrw  sscratch, t2
   j     .Lrestore_trap_registers
 

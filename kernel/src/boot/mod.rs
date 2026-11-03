@@ -140,6 +140,13 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
   let text_memory = kernel_state::create_memory(kernel_state::bootstrap_space(), process.authority)
     .unwrap_or_else(|error| fail("Memory Object", error.as_str()));
   report::memory_object(text_memory.object, text_memory.capability);
+  let initialized_image = kernel_state::initialize_user_image(
+    process.space,
+    text_memory.capability,
+    crate::user_image::INITIAL_USER_IMAGE,
+  )
+  .unwrap_or_else(|error| fail("User Image", error.as_str()));
+  report::initialized_user_image(initialized_image);
   let stack_memory =
     kernel_state::create_memory(kernel_state::bootstrap_space(), process.authority)
       .unwrap_or_else(|error| fail("Memory Object", error.as_str()));
@@ -172,10 +179,32 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
     );
   }
   report::user_image(text_mapping, stack_mapping);
-  kernel_thread::reset_smoke_state();
   let affinity = 1u64
     .checked_shl(boot_index as u32)
     .unwrap_or_else(|| fail("Kernel Thread", "invalid boot hart affinity"));
+  let attached = kernel_state::attach_address_space(
+    kernel_state::bootstrap_space(),
+    process.authority,
+    process.space,
+    user_space.capability,
+  )
+  .unwrap_or_else(|error| fail("User Process", error.as_str()));
+  let user_thread = kernel_state::create_user_thread(
+    kernel_state::bootstrap_space(),
+    process.authority,
+    affinity,
+    crate::thread::MIN_PRIORITY,
+  )
+  .unwrap_or_else(|error| fail("User Thread", error.as_str()));
+  let second_user_thread = kernel_state::create_user_thread(
+    kernel_state::bootstrap_space(),
+    process.authority,
+    affinity,
+    crate::thread::MIN_PRIORITY,
+  )
+  .unwrap_or_else(|error| fail("User Thread", error.as_str()));
+  report::prepared_user_thread(attached, user_thread);
+  kernel_thread::reset_smoke_state();
   let thread = kernel_state::create_thread(
     kernel_state::bootstrap_space(),
     process.authority,
@@ -218,6 +247,55 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
     fail("Kernel Thread", "smoke Thread did not park cleanly");
   }
   report::kernel_thread(thread.object, process.object, affinity);
+
+  kernel_state::wake_thread(user_thread.object)
+    .unwrap_or_else(|error| fail("User Scheduling", error.as_str()));
+  kernel_state::wake_thread(second_user_thread.object)
+    .unwrap_or_else(|error| fail("User Scheduling", error.as_str()));
+
+  let mut dispatches = [None; 16];
+  let mut dispatch_count = 0usize;
+  while dispatch_count < dispatches.len() {
+    let next = kernel_state::dispatch_current_hart_once()
+      .unwrap_or_else(|error| fail("User Scheduling", error.as_str()));
+    let Some(thread) = next else {
+      break;
+    };
+    dispatches[dispatch_count] = Some(thread);
+    dispatch_count += 1;
+    let summary = kernel_state::user_pair_summary(user_thread.object, second_user_thread.object)
+      .unwrap_or_else(|error| fail("User Scheduling", error.as_str()));
+    if summary.both_stopped() {
+      break;
+    }
+  }
+  let summary = kernel_state::user_pair_summary(user_thread.object, second_user_thread.object)
+    .unwrap_or_else(|error| fail("User Scheduling", error.as_str()));
+  if !summary.both_stopped()
+    || summary.total_yields != 6
+    || dispatch_count < 7
+    || dispatches[..6].windows(2).any(|pair| pair[0] == pair[1])
+  {
+    fail("User Scheduling", "user round-robin smoke did not converge");
+  }
+  report::user_scheduling(summary, dispatch_count);
+
+  let user_summary = kernel_state::user_dispatch_summary(user_thread.object, boot_index)
+    .unwrap_or_else(|error| fail("User Dispatch", error.as_str()));
+  if user_summary.state != crate::thread::ThreadState::Stopped
+    || user_summary.active_harts != 0
+    || user_summary.current_thread.is_some()
+  {
+    fail(
+      "User Dispatch",
+      "controlled user return left published state",
+    );
+  }
+  report::user_dispatch(user_summary);
+
+  let termination = kernel_state::termination_summary(process.object)
+    .unwrap_or_else(|error| fail("Process Termination", error.as_str()));
+  report::process_termination(termination);
 
   report::scheduler_runtime();
   report::complete();

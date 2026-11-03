@@ -15,6 +15,92 @@ pub enum ProcessState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminationReason {
+  Exit {
+    status: usize,
+  },
+  UnknownSyscall {
+    number: usize,
+  },
+  IllegalInstruction {
+    sepc: usize,
+    stval: usize,
+  },
+  Breakpoint {
+    sepc: usize,
+  },
+  InstructionPageFault {
+    sepc: usize,
+    stval: usize,
+  },
+  LoadPageFault {
+    sepc: usize,
+    stval: usize,
+  },
+  StorePageFault {
+    sepc: usize,
+    stval: usize,
+  },
+  UnknownException {
+    code: usize,
+    sepc: usize,
+    stval: usize,
+  },
+}
+
+impl TerminationReason {
+  pub const fn name(self) -> &'static str {
+    match self {
+      Self::Exit { .. } => "exit",
+      Self::UnknownSyscall { .. } => "unknown syscall",
+      Self::IllegalInstruction { .. } => "illegal instruction",
+      Self::Breakpoint { .. } => "breakpoint",
+      Self::InstructionPageFault { .. } => "instruction page fault",
+      Self::LoadPageFault { .. } => "load page fault",
+      Self::StorePageFault { .. } => "store page fault",
+      Self::UnknownException { .. } => "unknown user exception",
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminationProgress {
+  Pending,
+  Quiescent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeathNotificationState {
+  Pending,
+  Delivered,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminationRecord {
+  reason: TerminationReason,
+  progress: TerminationProgress,
+  notification: DeathNotificationState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BeginTermination {
+  pub record: TerminationRecord,
+  pub leader: bool,
+}
+
+impl TerminationRecord {
+  pub const fn reason(self) -> TerminationReason {
+    self.reason
+  }
+  pub const fn progress(self) -> TerminationProgress {
+    self.progress
+  }
+  pub const fn notification(self) -> DeathNotificationState {
+    self.notification
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
   InvalidLimit,
   InvalidState,
@@ -179,6 +265,7 @@ pub struct Process {
   limits: ProcessLimits,
   usage: ResourceUsage,
   state: ProcessState,
+  termination: Option<TerminationRecord>,
 }
 
 impl Process {
@@ -198,6 +285,7 @@ impl Process {
         ipc_queue_capacity: 0,
       },
       state: ProcessState::Created,
+      termination: None,
     }
   }
 
@@ -219,6 +307,54 @@ impl Process {
 
   pub const fn state(&self) -> ProcessState {
     self.state
+  }
+
+  pub const fn termination(&self) -> Option<TerminationRecord> {
+    self.termination
+  }
+
+  pub fn begin_termination_once(
+    &mut self,
+    reason: TerminationReason,
+  ) -> Result<BeginTermination, Error> {
+    match (self.state, self.termination) {
+      (ProcessState::Alive, None) => {
+        let record = TerminationRecord {
+          reason,
+          progress: TerminationProgress::Pending,
+          notification: DeathNotificationState::Pending,
+        };
+        self.state = ProcessState::Stopping;
+        self.termination = Some(record);
+        Ok(BeginTermination {
+          record,
+          leader: true,
+        })
+      }
+      (ProcessState::Stopping, Some(record)) => Ok(BeginTermination {
+        record,
+        leader: false,
+      }),
+      _ => Err(Error::InvalidState),
+    }
+  }
+
+  pub fn mark_termination_quiescent(&mut self) -> Result<(), Error> {
+    if self.state != ProcessState::Stopping {
+      return Err(Error::InvalidState);
+    }
+    let record = self.termination.as_mut().ok_or(Error::InvalidState)?;
+    record.progress = TerminationProgress::Quiescent;
+    Ok(())
+  }
+
+  pub fn replace_address_space(&mut self, address_space: ObjectId) -> Result<ObjectId, Error> {
+    if self.state != ProcessState::Alive || self.usage.threads != 0 {
+      return Err(Error::InvalidState);
+    }
+    let previous = self.address_space;
+    self.address_space = address_space;
+    Ok(previous)
   }
 
   pub fn start(&mut self) -> Result<(), Error> {
@@ -454,5 +590,78 @@ mod tests {
       ProcessLimits::new(1, 1, MAX_CAPABILITY_SLOTS as u16 + 1, 1),
       Err(Error::InvalidLimit)
     );
+  }
+
+  #[test]
+  fn proc_070_alive_process_without_threads_replaces_address_space() {
+    let replacement = ObjectId::from_raw_parts(2, 1);
+    let mut process = alive_process();
+    assert_eq!(
+      process.replace_address_space(replacement),
+      Ok(ADDRESS_SPACE)
+    );
+    assert_eq!(process.address_space(), replacement);
+  }
+
+  #[test]
+  fn proc_071_process_with_thread_rejects_address_space_replacement() {
+    let replacement = ObjectId::from_raw_parts(2, 1);
+    let mut process = alive_process();
+    process
+      .charge(ResourceCharge {
+        threads: 1,
+        ..ResourceCharge::default()
+      })
+      .unwrap();
+    assert_eq!(
+      process.replace_address_space(replacement),
+      Err(Error::InvalidState)
+    );
+    assert_eq!(process.address_space(), ADDRESS_SPACE);
+  }
+
+  #[test]
+  fn proc_080_termination_reason_is_first_wins() {
+    let mut process = alive_process();
+    let first = process
+      .begin_termination_once(TerminationReason::Exit { status: 7 })
+      .unwrap();
+    let follower = process
+      .begin_termination_once(TerminationReason::UnknownSyscall { number: 99 })
+      .unwrap();
+    assert!(first.leader);
+    assert!(!follower.leader);
+    assert_eq!(follower.record, first.record);
+    assert_eq!(process.state(), ProcessState::Stopping);
+  }
+
+  #[test]
+  fn proc_081_termination_progress_reaches_quiescent() {
+    let mut process = alive_process();
+    process
+      .begin_termination_once(TerminationReason::Exit { status: 0 })
+      .unwrap();
+    process.mark_termination_quiescent().unwrap();
+    assert_eq!(
+      process.termination().unwrap().progress(),
+      TerminationProgress::Quiescent
+    );
+  }
+
+  #[test]
+  fn proc_082_quiescent_does_not_bypass_resource_reclamation() {
+    let mut process = alive_process();
+    process
+      .charge(ResourceCharge {
+        threads: 1,
+        ..ResourceCharge::default()
+      })
+      .unwrap();
+    process
+      .begin_termination_once(TerminationReason::Exit { status: 0 })
+      .unwrap();
+    process.mark_termination_quiescent().unwrap();
+    assert_eq!(process.finish_stop(), Err(Error::ResourcesStillLive));
+    assert_eq!(process.state(), ProcessState::Stopping);
   }
 }
