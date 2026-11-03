@@ -1,6 +1,8 @@
 .section .text.trap, "ax"
 .global trap_entry
 .type trap_entry, @function
+.global resume_trap_context
+.type resume_trap_context, @function
 .align 2
 
 .equ TRAP_FRAME_SIZE, 288
@@ -56,6 +58,7 @@ trap_entry:
   mv    a0, sp
   call  trap_handler
 
+resume_trap_context:
   ld    t0, 32 * 8(sp)
   ld    t1, 33 * 8(sp)
   csrw  sstatus, t0
@@ -96,3 +99,4 @@ trap_entry:
   sret
 
 .size trap_entry, . - trap_entry
+.size resume_trap_context, . - resume_trap_context

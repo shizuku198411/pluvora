@@ -16,3 +16,12 @@ class SupervisorTimerTests(QemuTestCase):
         self.assertNotIn("[Fatal S-mode Trap]", self.output)
         self.assertNotIn("[Boot Failure]", self.output)
         self.assertNotIn("[PANIC]", self.output)
+
+    def test_timer_q003_preempts_and_resumes_kernel_thread(self) -> None:
+        timer = self.output.index("[Supervisor Timer]")
+        thread = self.output.index("[Kernel Thread Dispatch]")
+        complete = self.output.index(SUCCESS_MARKER)
+        self.assertLess(timer, thread)
+        self.assertLess(thread, complete)
+        self.assertIn("Timer preemption  : yes", self.output)
+        self.assertIn("Resume mechanism  : sret", self.output)

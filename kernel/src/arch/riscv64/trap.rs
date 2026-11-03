@@ -4,6 +4,7 @@ use core::arch::asm;
 #[cfg(target_arch = "riscv64")]
 use crate::{
   arch::riscv64::{ipi, timer},
+  kernel_state,
   support::{console, cpu},
 };
 
@@ -170,6 +171,7 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
 
   if cause == Cause::Interrupt(Interrupt::SupervisorTimer) {
     timer::handle_local();
+    kernel_state::try_preempt_current_thread(frame);
     return;
   }
 

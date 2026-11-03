@@ -128,6 +128,13 @@ impl HartLocal {
     self.reschedule_pending.swap(false, Ordering::AcqRel)
   }
 
+  pub(crate) fn can_preempt(&self) -> bool {
+    self.interrupt_disable_depth.load(Ordering::Relaxed) == 0
+      && self.preemption_disable_depth.load(Ordering::Relaxed) == 0
+      && self.current_thread().is_some()
+      && self.pending_yield().is_none()
+  }
+
   fn enter_interrupt_disabled(&self, interrupts_were_enabled: bool) -> Result<(), DepthError> {
     let previous = increment_depth(&self.interrupt_disable_depth)?;
     if previous == 0 {
@@ -305,6 +312,37 @@ fn disable_local_interrupts() -> bool {
 fn enable_local_interrupts() {
   const SSTATUS_SIE: usize = 1 << 1;
   unsafe { asm!("csrs sstatus, {mask}", mask = in(reg) SSTATUS_SIE, options(nomem, nostack)) };
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) struct ThreadInterruptWindow {
+  restore_enabled: bool,
+}
+
+#[cfg(target_arch = "riscv64")]
+impl ThreadInterruptWindow {
+  pub(crate) fn mask_scheduler() -> Self {
+    let local = current();
+    assert!(
+      local.interrupts_are_unmasked(),
+      "cannot dispatch inside InterruptGuard"
+    );
+    let restore_enabled = disable_local_interrupts();
+    Self { restore_enabled }
+  }
+
+  pub(crate) fn returned_to_scheduler(&self) {
+    disable_local_interrupts();
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+impl Drop for ThreadInterruptWindow {
+  fn drop(&mut self) {
+    if self.restore_enabled {
+      enable_local_interrupts();
+    }
+  }
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -781,5 +819,20 @@ mod tests {
     );
     assert_eq!(local.clear_pending_yield(thread), Ok(()));
     assert_eq!(local.pending_yield(), None);
+  }
+
+  #[test]
+  fn sched_032_preemption_requires_unguarded_current_thread() {
+    let local = configured_local(0, 0, HART_ONLINE);
+    let thread = ObjectId::from_raw_parts(3, 1);
+    assert!(!local.can_preempt());
+
+    local.install_current_thread(thread).unwrap();
+    assert!(local.can_preempt());
+    local.enter_preemption_disabled().unwrap();
+    assert!(!local.can_preempt());
+    local.leave_preemption_disabled().unwrap();
+    local.enter_interrupt_disabled(true).unwrap();
+    assert!(!local.can_preempt());
   }
 }

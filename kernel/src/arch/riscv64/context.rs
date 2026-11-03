@@ -24,6 +24,7 @@ pub enum Error {
   InvalidStackTop,
   HartLocalChanged,
   SmokeDidNotReturn,
+  InvalidTrapFrame,
 }
 
 impl Error {
@@ -34,6 +35,7 @@ impl Error {
       Self::InvalidStackTop => "context stack top is invalid",
       Self::HartLocalChanged => "context switch changed the hart-local identity",
       Self::SmokeDidNotReturn => "context switch smoke test did not return",
+      Self::InvalidTrapFrame => "trap frame context is invalid",
     }
   }
 }
@@ -67,6 +69,23 @@ impl SavedContext {
       s: [0; 12],
     })
   }
+
+  #[cfg(target_arch = "riscv64")]
+  pub(crate) fn trap_resume(frame: usize) -> Result<Self, Error> {
+    validate_trap_frame(frame)?;
+    Ok(Self {
+      ra: resume_trap_context as *const () as usize,
+      sp: frame,
+      s: [0; 12],
+    })
+  }
+}
+
+fn validate_trap_frame(frame: usize) -> Result<(), Error> {
+  if frame == 0 || !frame.is_multiple_of(KERNEL_STACK_ALIGNMENT) {
+    return Err(Error::InvalidTrapFrame);
+  }
+  Ok(())
 }
 
 const _: () = {
@@ -109,8 +128,28 @@ pub(crate) unsafe fn switch_saved_context(
 }
 
 #[cfg(target_arch = "riscv64")]
+pub(crate) unsafe fn switch_to_thread(outgoing: *mut SavedContext, incoming: *const SavedContext) {
+  assert!(!outgoing.is_null(), "outgoing context pointer is null");
+  assert!(!incoming.is_null(), "incoming context pointer is null");
+  assert_ne!(outgoing.cast_const(), incoming, "context pointers alias");
+  // SAFETY: caller owns both contexts and enters with scheduler interrupts masked.
+  unsafe { switch_context_to_thread(outgoing, incoming) };
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) unsafe fn restore_scheduler_context(hart: usize) -> ! {
+  let scheduler =
+    scheduler_context(hart).unwrap_or_else(|_| panic!("scheduler context is unavailable"));
+  // SAFETY: caller transferred execution ownership away from the current Thread.
+  unsafe { restore_context(scheduler.cast_const()) }
+}
+
+#[cfg(target_arch = "riscv64")]
 unsafe extern "C" {
   fn switch_context(old: *mut SavedContext, new: *const SavedContext);
+  fn switch_context_to_thread(old: *mut SavedContext, new: *const SavedContext);
+  fn restore_context(new: *const SavedContext) -> !;
+  fn resume_trap_context() -> !;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -188,5 +227,12 @@ mod tests {
       SavedContext::initial(0, 0x8000),
       Err(Error::InvalidEntry)
     ));
+  }
+
+  #[test]
+  fn context_004_trap_resume_requires_aligned_live_frame() {
+    assert_eq!(validate_trap_frame(0), Err(Error::InvalidTrapFrame));
+    assert_eq!(validate_trap_frame(0x8001), Err(Error::InvalidTrapFrame));
+    assert_eq!(validate_trap_frame(0x8000), Ok(()));
   }
 }

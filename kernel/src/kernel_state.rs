@@ -756,6 +756,57 @@ impl KernelState {
   }
 
   #[cfg(target_arch = "riscv64")]
+  fn prepare_timer_preemption(
+    &mut self,
+    hart: usize,
+    thread_id: ObjectId,
+    trap_frame: usize,
+  ) -> Result<(), Error> {
+    let local = crate::arch::riscv64::hart::local_by_index(hart).ok_or(Error::Hart(
+      crate::arch::riscv64::hart::Error::InvalidHartIndex,
+    ))?;
+    if local.current_thread() != Some(thread_id) || local.pending_yield().is_some() {
+      return Err(Error::CommitInvariant);
+    }
+    let snapshot = self.thread_snapshot(thread_id)?;
+    if snapshot.state != ThreadState::Running || snapshot.running_hart != u16::try_from(hart).ok() {
+      return Err(Error::CommitInvariant);
+    }
+    if self.scheduler()?.running_thread(hart)? != Some(thread_id) {
+      return Err(Error::CommitInvariant);
+    }
+
+    let trap_context = crate::arch::riscv64::context::SavedContext::trap_resume(trap_frame)
+      .map_err(thread::Error::Context)?;
+
+    local
+      .install_pending_yield(thread_id)
+      .unwrap_or_else(|_| panic!("preflighted timer pending yield failed"));
+    self
+      .scheduler_mut()
+      .unwrap_or_else(|_| panic!("initialized scheduler disappeared"))
+      .suspend_running(hart, thread_id)
+      .unwrap_or_else(|_| panic!("preflighted timer scheduler suspend failed"));
+    let thread = self
+      .objects
+      .get_mut(thread_id)
+      .unwrap_or_else(|_| panic!("preempted Thread disappeared"))
+      .as_thread_mut()
+      .unwrap_or_else(|| panic!("preempted Object changed type"));
+    thread
+      .begin_switch_out()
+      .unwrap_or_else(|_| panic!("running Thread refused timer switch-out"));
+    *thread
+      .execution_mut()
+      .unwrap_or_else(|| panic!("preempted Thread lost execution"))
+      .context_mut() = trap_context;
+    local
+      .clear_current_thread(thread_id)
+      .unwrap_or_else(|_| panic!("current Thread changed during timer preemption"));
+    Ok(())
+  }
+
+  #[cfg(target_arch = "riscv64")]
   fn finalize_current_hart_yield(&mut self, hart: usize) -> Result<Option<ObjectId>, Error> {
     let local = crate::arch::riscv64::hart::local_by_index(hart).ok_or(Error::Hart(
       crate::arch::riscv64::hart::Error::InvalidHartIndex,
@@ -934,9 +985,36 @@ pub fn global_scheduler_summary() -> Result<(u64, usize, usize), Error> {
 }
 
 #[cfg(target_arch = "riscv64")]
+pub(crate) fn try_preempt_current_thread(trap_frame: *mut crate::arch::riscv64::trap::TrapFrame) {
+  let hart = crate::arch::riscv64::hart::current_index();
+  let local = crate::arch::riscv64::hart::current();
+  if trap_frame.is_null() {
+    return;
+  }
+  let Some(thread_id) = local.current_thread() else {
+    return;
+  };
+  if !local.can_preempt() {
+    return;
+  }
+  let Some(mut state) = KERNEL_STATE.try_lock() else {
+    return;
+  };
+  state
+    .prepare_timer_preemption(hart, thread_id, trap_frame as usize)
+    .unwrap_or_else(|_| panic!("failed timer preemption transaction"));
+  if !local.take_reschedule_request() {
+    panic!("timer preemption lost reschedule request");
+  }
+  drop(state);
+
+  // SAFETY: Thread state and ownership were unpublished, and its TrapFrame is live.
+  unsafe { crate::arch::riscv64::context::restore_scheduler_context(hart) }
+}
+
+#[cfg(target_arch = "riscv64")]
 pub fn dispatch_current_hart_once() -> Result<Option<ObjectId>, Error> {
-  let _interrupt = crate::arch::riscv64::hart::InterruptGuard::disable();
-  let _preemption = crate::arch::riscv64::hart::PreemptionGuard::disable();
+  let interrupt_window = crate::arch::riscv64::hart::ThreadInterruptWindow::mask_scheduler();
   let hart = crate::arch::riscv64::hart::current_index();
   let scheduler =
     crate::arch::riscv64::context::scheduler_context(hart).map_err(thread::Error::Context)?;
@@ -948,8 +1026,11 @@ pub fn dispatch_current_hart_once() -> Result<Option<ObjectId>, Error> {
     return Ok(None);
   };
 
+  crate::arch::riscv64::timer::begin_quantum()
+    .unwrap_or_else(|_| panic!("failed to arm Thread scheduling quantum"));
   // SAFETY: publication is complete, both contexts are live, and the state lock is dropped.
-  unsafe { crate::arch::riscv64::context::switch_saved_context(scheduler, incoming) };
+  unsafe { crate::arch::riscv64::context::switch_to_thread(scheduler, incoming) };
+  interrupt_window.returned_to_scheduler();
 
   {
     let mut state = KERNEL_STATE.lock();

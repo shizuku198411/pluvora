@@ -141,9 +141,10 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
     .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
   if dispatched != Some(thread.object)
     || !kernel_thread::smoke_entered()
+    || kernel_thread::smoke_preempted()
     || kernel_thread::smoke_resumed()
   {
-    fail("Kernel Thread", "smoke Thread did not yield");
+    fail("Kernel Thread", "smoke Thread was not timer-preempted");
   }
   let (_, runnable, running) = kernel_state::global_scheduler_summary()
     .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
@@ -153,8 +154,11 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
 
   let redispatched = kernel_state::dispatch_current_hart_once()
     .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
-  if redispatched != Some(thread.object) || !kernel_thread::smoke_resumed() {
-    fail("Kernel Thread", "smoke Thread did not resume");
+  if redispatched != Some(thread.object)
+    || !kernel_thread::smoke_preempted()
+    || !kernel_thread::smoke_resumed()
+  {
+    fail("Kernel Thread", "preempted smoke Thread did not resume");
   }
   let (_, runnable, running) = kernel_state::global_scheduler_summary()
     .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));

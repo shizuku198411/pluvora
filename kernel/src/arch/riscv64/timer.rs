@@ -85,6 +85,11 @@ pub fn initialize_local() -> Result<u64, Error> {
 }
 
 #[cfg(target_arch = "riscv64")]
+pub(crate) fn begin_quantum() -> Result<u64, Error> {
+  arm_next()
+}
+
+#[cfg(target_arch = "riscv64")]
 pub fn handle_local() {
   let index = hart::current_index();
   arm_next().unwrap_or_else(|_| panic!("failed to rearm local timer"));

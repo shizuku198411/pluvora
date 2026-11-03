@@ -34,6 +34,19 @@ impl<T> SpinLock<T> {
   }
 
   #[cfg(target_arch = "riscv64")]
+  pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+    let preemption = PreemptionGuard::disable();
+    if !self.try_acquire() {
+      drop(preemption);
+      return None;
+    }
+    Some(SpinLockGuard {
+      lock: self,
+      _preemption: preemption,
+    })
+  }
+
+  #[cfg(target_arch = "riscv64")]
   pub fn lock_irqsave(&self) -> IrqSpinLockGuard<'_, T> {
     let interrupt = InterruptGuard::disable();
     let preemption = PreemptionGuard::disable();
