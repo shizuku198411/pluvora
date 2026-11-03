@@ -85,6 +85,20 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
     fail("runtime Memory", "kernel stack round-trip leaked frames");
   }
   report::runtime_memory(free_after, stack_top);
+  let user_table =
+    crate::memory::user_page_table::UserPageTable::clone_kernel_root(paging.root_frame())
+      .unwrap_or_else(|error| fail("User Address Space", error.as_str()));
+  let user_root = user_table.root_frame();
+  let owned_frames = user_table.owned_frames();
+  user_table
+    .release()
+    .unwrap_or_else(|error| fail("User Address Space", error.as_str()));
+  let free_after_user = frame_allocator::free_frames()
+    .unwrap_or_else(|error| fail("User Address Space", error.as_str()));
+  if free_after_user != free_after {
+    fail("User Address Space", "Page Table smoke leaked frames");
+  }
+  report::user_address_space(user_root, owned_frames);
   let kernel_space = kernel_state::initialize_kernel_address_space(paging.root_frame())
     .unwrap_or_else(|error| fail("Kernel Objects", error.as_str()));
   let (object_count, capability_count, capability_space_count) = kernel_state::counts();

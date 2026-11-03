@@ -7,15 +7,16 @@ use core::arch::asm;
 use crate::memory::{EarlyFrameAllocator, Error as MemoryError, PAGE_SIZE};
 use crate::platform::{MemoryRegion, PlatformInfo};
 
-const ENTRIES_PER_TABLE: usize = 512;
+pub(crate) const ENTRIES_PER_TABLE: usize = 512;
 const VPN_MASK: u64 = 0x1ff;
 const PTE_PPN_SHIFT: u64 = 10;
 const PAGE_SHIFT: u64 = 12;
 
-const PTE_VALID: u64 = 1 << 0;
+pub(crate) const PTE_VALID: u64 = 1 << 0;
 const PTE_READ: u64 = 1 << 1;
 const PTE_WRITE: u64 = 1 << 2;
 const PTE_EXECUTE: u64 = 1 << 3;
+pub(crate) const PTE_USER: u64 = 1 << 4;
 const PTE_ACCESSED: u64 = 1 << 6;
 const PTE_DIRTY: u64 = 1 << 7;
 
@@ -23,7 +24,7 @@ const SATP_MODE_SV39: u64 = 8;
 const SATP_MODE_SHIFT: u64 = 60;
 const SATP_ASID_SHIFT: u64 = 44;
 const SATP_ASID_MASK: u64 = 0xffff;
-const SATP_PPN_MASK: u64 = (1 << 44) - 1;
+pub(crate) const SATP_PPN_MASK: u64 = (1 << 44) - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -75,6 +76,24 @@ impl Permissions {
       Self::ReadWrite => PTE_READ | PTE_WRITE | PTE_ACCESSED | PTE_DIRTY,
       Self::ReadExecute => PTE_READ | PTE_EXECUTE | PTE_ACCESSED,
     }
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserPermissions {
+  ReadOnly,
+  ReadWrite,
+  ReadExecute,
+}
+
+impl UserPermissions {
+  pub(crate) const fn pte_flags(self) -> u64 {
+    let access = match self {
+      Self::ReadOnly => PTE_READ | PTE_ACCESSED,
+      Self::ReadWrite => PTE_READ | PTE_WRITE | PTE_ACCESSED | PTE_DIRTY,
+      Self::ReadExecute => PTE_READ | PTE_EXECUTE | PTE_ACCESSED,
+    };
+    access | PTE_USER
   }
 }
 
@@ -295,15 +314,15 @@ fn allocate_table_frame(allocator: &mut EarlyFrameAllocator<'_>) -> Result<u64, 
     .ok_or(Error::OutOfMemory)
 }
 
-fn table_pointer(physical_address: u64) -> u64 {
+pub(crate) fn table_pointer(physical_address: u64) -> u64 {
   ((physical_address >> PAGE_SHIFT) << PTE_PPN_SHIFT) | PTE_VALID
 }
 
-fn pte_physical_address(entry: u64) -> u64 {
+pub(crate) fn pte_physical_address(entry: u64) -> u64 {
   ((entry >> PTE_PPN_SHIFT) & SATP_PPN_MASK) << PAGE_SHIFT
 }
 
-fn is_leaf(entry: u64) -> bool {
+pub(crate) fn is_leaf(entry: u64) -> bool {
   entry & (PTE_READ | PTE_WRITE | PTE_EXECUTE) != 0
 }
 
@@ -322,7 +341,7 @@ fn write_entry(table_frame: u64, index: usize, value: u64) -> Result<(), Error> 
   Ok(())
 }
 
-fn entry_address(table_frame: u64, index: usize) -> Result<usize, Error> {
+pub(crate) fn entry_address(table_frame: u64, index: usize) -> Result<usize, Error> {
   if index >= ENTRIES_PER_TABLE || !table_frame.is_multiple_of(PAGE_SIZE) {
     return Err(Error::InvalidPhysicalAddress);
   }
@@ -335,7 +354,7 @@ fn entry_address(table_frame: u64, index: usize) -> Result<usize, Error> {
   usize::try_from(address).map_err(|_| Error::InvalidPhysicalAddress)
 }
 
-fn vpn_indices(virtual_address: u64) -> [usize; 3] {
+pub(crate) fn vpn_indices(virtual_address: u64) -> [usize; 3] {
   [
     ((virtual_address >> 12) & VPN_MASK) as usize,
     ((virtual_address >> 21) & VPN_MASK) as usize,

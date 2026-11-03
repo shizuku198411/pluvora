@@ -287,3 +287,4 @@ mod tests {
 pub mod address_space;
 pub mod frame_allocator;
 pub mod kernel_stack;
+pub mod user_page_table;

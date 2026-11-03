@@ -133,6 +133,24 @@ pub fn runtime_memory(free_frames: usize, stack_top: usize) {
   usize_field("Stack top alignment", stack_top & 0xf);
 }
 
+pub fn user_address_space(root: u64, owned_frames: usize) {
+  section("User Address Space");
+  u64_field("Smoke root", root);
+  usize_field("Owned PT frames", owned_frames);
+  u64_field(
+    "User window start",
+    crate::memory::user_page_table::USER_WINDOW_START,
+  );
+  u64_field(
+    "User window end",
+    crate::memory::user_page_table::USER_WINDOW_END,
+  );
+  console::write_line("  Kernel mappings   : supervisor-only shared");
+  console::write_line("  User mappings     : private U-bit subtree");
+  console::write_line("  W^X policy        : enforced by type");
+  console::write_line("  Release smoke     : verified");
+}
+
 pub fn memory_map(platform: &PlatformInfo, kernel_region: MemoryRegion, dtb_region: MemoryRegion) {
   section("Physical Memory");
   console::write_line("  Available RAM:");
