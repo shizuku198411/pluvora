@@ -290,6 +290,11 @@ pub fn free_frames() -> Result<usize, Error> {
 }
 
 #[cfg(test)]
+pub(crate) const fn frame_block_for_test(start: u64, frames: usize) -> FrameBlock {
+  FrameBlock { start, frames }
+}
+
+#[cfg(test)]
 mod tests {
   use core::ptr;
   use std::alloc::{Layout, alloc, dealloc};

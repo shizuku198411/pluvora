@@ -1,3 +1,5 @@
+use crate::arch::riscv64::context::{self, SavedContext};
+use crate::memory::kernel_stack::KernelStack;
 use crate::object::ObjectId;
 use crate::platform::MAX_HARTS;
 
@@ -25,10 +27,14 @@ pub enum Error {
   AffinityViolation,
   InvalidPriority,
   InvalidState,
+  ExecutionAlreadyInstalled,
+  ExecutionMissing,
+  Context(context::Error),
 }
 
 pub struct Thread {
   process: ObjectId,
+  execution: Option<ThreadExecution>,
   state: ThreadState,
   affinity: u64,
   base_priority: u8,
@@ -42,6 +48,7 @@ impl Thread {
     validate_priority(priority)?;
     Ok(Self {
       process,
+      execution: None,
       state: ThreadState::New,
       affinity,
       base_priority: priority,
@@ -139,6 +146,87 @@ impl Thread {
 
   pub fn restore_base_priority(&mut self) {
     self.effective_priority = self.base_priority;
+  }
+
+  pub fn install_execution(
+    &mut self,
+    stack: KernelStack,
+    entry: usize,
+  ) -> Result<(), InstallExecutionError> {
+    if self.execution.is_some() {
+      return Err(InstallExecutionError {
+        error: Error::ExecutionAlreadyInstalled,
+        stack,
+      });
+    }
+    let context = match SavedContext::initial(entry, stack.top()) {
+      Ok(context) => context,
+      Err(error) => {
+        return Err(InstallExecutionError {
+          error: Error::Context(error),
+          stack,
+        });
+      }
+    };
+    self.execution = Some(ThreadExecution {
+      context,
+      kernel_stack: stack,
+    });
+    Ok(())
+  }
+
+  pub const fn has_execution(&self) -> bool {
+    self.execution.is_some()
+  }
+
+  pub const fn execution(&self) -> Option<&ThreadExecution> {
+    self.execution.as_ref()
+  }
+
+  pub fn execution_mut(&mut self) -> Option<&mut ThreadExecution> {
+    self.execution.as_mut()
+  }
+
+  pub fn into_execution(self) -> Option<ThreadExecution> {
+    self.execution
+  }
+}
+
+pub struct ThreadExecution {
+  context: SavedContext,
+  kernel_stack: KernelStack,
+}
+
+impl ThreadExecution {
+  pub const fn context(&self) -> &SavedContext {
+    &self.context
+  }
+
+  pub fn context_mut(&mut self) -> &mut SavedContext {
+    &mut self.context
+  }
+
+  pub const fn kernel_stack(&self) -> &KernelStack {
+    &self.kernel_stack
+  }
+
+  pub fn into_kernel_stack(self) -> KernelStack {
+    self.kernel_stack
+  }
+}
+
+pub struct InstallExecutionError {
+  error: Error,
+  stack: KernelStack,
+}
+
+impl InstallExecutionError {
+  pub const fn error(&self) -> Error {
+    self.error
+  }
+
+  pub fn into_parts(self) -> (Error, KernelStack) {
+    (self.error, self.stack)
   }
 }
 
@@ -268,5 +356,26 @@ mod tests {
     assert_eq!(thread.begin_running(0), Err(Error::InvalidState));
     assert_eq!(thread.state(), ThreadState::New);
     assert_eq!(thread.running_hart(), None);
+  }
+
+  #[test]
+  fn thread_010_execution_resources_install_once() {
+    use crate::memory::kernel_stack::kernel_stack_for_test;
+
+    let mut thread = Thread::new(PROCESS, 1, 8).unwrap();
+    assert!(!thread.has_execution());
+    thread
+      .install_execution(kernel_stack_for_test(0x9000_0000), 0x8020_0000)
+      .unwrap_or_else(|_| panic!("test execution installation failed"));
+    assert!(thread.has_execution());
+    assert_eq!(
+      thread.execution().unwrap().kernel_stack().base(),
+      0x9000_0000
+    );
+    let failure = thread
+      .install_execution(kernel_stack_for_test(0x9001_0000), 0x8020_0000)
+      .expect_err("second execution install must fail");
+    assert_eq!(failure.error(), Error::ExecutionAlreadyInstalled);
+    assert_eq!(failure.into_parts().1.base(), 0x9001_0000);
   }
 }

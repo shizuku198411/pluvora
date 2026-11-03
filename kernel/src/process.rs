@@ -236,6 +236,14 @@ impl Process {
     self.usage.charge(self.limits, charge)
   }
 
+  pub fn can_charge(&self, charge: ResourceCharge) -> Result<(), Error> {
+    if !matches!(self.state, ProcessState::Created | ProcessState::Alive) {
+      return Err(Error::InvalidState);
+    }
+    let mut usage = self.usage;
+    usage.charge(self.limits, charge)
+  }
+
   pub fn release(&mut self, release: ResourceCharge) -> Result<(), Error> {
     if self.state == ProcessState::Dead {
       return Err(Error::InvalidState);
@@ -390,6 +398,20 @@ mod tests {
     process.release(charge).unwrap();
     assert!(process.usage().is_empty());
     assert_eq!(process.release(charge), Err(Error::ResourceUnderflow));
+  }
+
+  #[test]
+  fn limit_007_charge_preflight_does_not_mutate_usage() {
+    let process = alive_process();
+    let before = process.usage();
+    assert_eq!(
+      process.can_charge(ResourceCharge {
+        threads: 1,
+        ..ResourceCharge::default()
+      }),
+      Ok(())
+    );
+    assert_eq!(process.usage(), before);
   }
 
   #[test]

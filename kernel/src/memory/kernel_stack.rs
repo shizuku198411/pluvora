@@ -63,3 +63,12 @@ impl KernelStack {
     Ok(())
   }
 }
+
+#[cfg(test)]
+pub(crate) fn kernel_stack_for_test(base: u64) -> KernelStack {
+  assert!(base != 0);
+  assert!(base.is_multiple_of(PAGE_SIZE));
+  KernelStack {
+    block: frame_allocator::frame_block_for_test(base, KERNEL_STACK_PAGES),
+  }
+}

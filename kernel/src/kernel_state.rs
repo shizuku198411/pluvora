@@ -3,9 +3,9 @@ use crate::capability_space::{self, CapabilitySpaceId, CapabilitySpaceTable};
 #[cfg(target_arch = "riscv64")]
 use crate::memory::address_space::{AddressSpace, Asid};
 use crate::object::{self, KernelObject, ObjectId, ObjectTable, ObjectType};
-use crate::process::ProcessState;
+use crate::process::{ProcessState, ResourceCharge};
 use crate::scheduler::{self, SchedulerState, WakeResult};
-use crate::thread::{self, ThreadState};
+use crate::thread::{self, Thread, ThreadState};
 
 #[cfg(target_arch = "riscv64")]
 use crate::sync::SpinLock;
@@ -26,6 +26,8 @@ pub enum Error {
   SchedulerUninitialized,
   Thread(thread::Error),
   ProcessNotAlive,
+  Process(crate::process::Error),
+  KernelStack(crate::memory::kernel_stack::Error),
   RollbackFailed,
 }
 
@@ -43,6 +45,8 @@ impl Error {
       Self::SchedulerUninitialized => "scheduler is not initialized",
       Self::Thread(_) => "thread state transition failed",
       Self::ProcessNotAlive => "owner process is not alive",
+      Self::Process(_) => "process resource accounting failed",
+      Self::KernelStack(_) => "kernel stack operation failed",
       Self::RollbackFailed => "kernel state transaction rollback failed",
     }
   }
@@ -84,6 +88,16 @@ pub struct KernelState {
   next_capability_node: u64,
   kernel_address_space: Option<CapabilityHandle>,
   scheduler: SchedulerState,
+}
+
+#[derive(Clone, Copy)]
+struct ThreadSnapshot {
+  process: ObjectId,
+  state: ThreadState,
+  affinity: u64,
+  priority: u8,
+  running_hart: Option<u16>,
+  has_execution: bool,
 }
 
 impl KernelState {
@@ -350,22 +364,20 @@ impl KernelState {
     Ok(&mut self.scheduler)
   }
 
-  fn thread_snapshot(
-    &mut self,
-    id: ObjectId,
-  ) -> Result<(ObjectId, ThreadState, u64, u8, Option<u16>), Error> {
+  fn thread_snapshot(&self, id: ObjectId) -> Result<ThreadSnapshot, Error> {
     let thread = self
       .objects
       .get(id)?
       .as_thread()
       .ok_or(Error::Object(object::Error::WrongObjectType))?;
-    Ok((
-      thread.process(),
-      thread.state(),
-      thread.affinity(),
-      thread.effective_priority(),
-      thread.running_hart(),
-    ))
+    Ok(ThreadSnapshot {
+      process: thread.process(),
+      state: thread.state(),
+      affinity: thread.affinity(),
+      priority: thread.effective_priority(),
+      running_hart: thread.running_hart(),
+      has_execution: thread.has_execution(),
+    })
   }
 
   fn require_process_alive(&self, id: ObjectId) -> Result<(), Error> {
@@ -381,15 +393,18 @@ impl KernelState {
   }
 
   pub fn wake_thread(&mut self, thread_id: ObjectId) -> Result<WakeResult, Error> {
-    let (process, state, affinity, priority, _) = self.thread_snapshot(thread_id)?;
-    self.require_process_alive(process)?;
-    if !matches!(state, ThreadState::New | ThreadState::Blocked) {
+    let snapshot = self.thread_snapshot(thread_id)?;
+    self.require_process_alive(snapshot.process)?;
+    if !snapshot.has_execution {
+      return Err(Error::Thread(thread::Error::ExecutionMissing));
+    }
+    if !matches!(snapshot.state, ThreadState::New | ThreadState::Blocked) {
       return Err(Error::Thread(thread::Error::InvalidState));
     }
 
     let result = self
       .scheduler_mut()?
-      .enqueue(thread_id, affinity, priority)?;
+      .enqueue(thread_id, snapshot.affinity, snapshot.priority)?;
     self
       .objects
       .get_mut(thread_id)?
@@ -405,11 +420,11 @@ impl KernelState {
     let Some(thread_id) = candidate else {
       return Ok(None);
     };
-    let (_, state, affinity, _, _) = self.thread_snapshot(thread_id)?;
+    let snapshot = self.thread_snapshot(thread_id)?;
     let hart_bit = 1u64
       .checked_shl(hart as u32)
       .ok_or(Error::CommitInvariant)?;
-    if state != ThreadState::Runnable || affinity & hart_bit == 0 {
+    if snapshot.state != ThreadState::Runnable || snapshot.affinity & hart_bit == 0 {
       return Err(Error::CommitInvariant);
     }
 
@@ -429,11 +444,13 @@ impl KernelState {
       .scheduler()?
       .running_thread(hart)?
       .ok_or(Error::Scheduler(scheduler::Error::NoRunningThread))?;
-    let (_, state, affinity, priority, running_hart) = self.thread_snapshot(thread_id)?;
-    if state != ThreadState::Running || running_hart != u16::try_from(hart).ok() {
+    let snapshot = self.thread_snapshot(thread_id)?;
+    if snapshot.state != ThreadState::Running || snapshot.running_hart != u16::try_from(hart).ok() {
       return Err(Error::CommitInvariant);
     }
-    let result = self.scheduler_mut()?.preempt(hart, affinity, priority)?;
+    let result = self
+      .scheduler_mut()?
+      .preempt(hart, snapshot.affinity, snapshot.priority)?;
     self
       .objects
       .get_mut(thread_id)?
@@ -449,8 +466,8 @@ impl KernelState {
       .scheduler()?
       .running_thread(hart)?
       .ok_or(Error::Scheduler(scheduler::Error::NoRunningThread))?;
-    let (_, state, _, _, running_hart) = self.thread_snapshot(thread_id)?;
-    if state != ThreadState::Running || running_hart != u16::try_from(hart).ok() {
+    let snapshot = self.thread_snapshot(thread_id)?;
+    if snapshot.state != ThreadState::Running || snapshot.running_hart != u16::try_from(hart).ok() {
       return Err(Error::CommitInvariant);
     }
     let removed = self.scheduler_mut()?.block_running(hart)?;
@@ -465,6 +482,122 @@ impl KernelState {
     Ok(thread_id)
   }
 
+  pub fn create_thread_in_space(
+    &mut self,
+    authority_space: CapabilitySpaceId,
+    process_handle: CapabilityHandle,
+    affinity: u64,
+    priority: u8,
+    entry: usize,
+    stack: crate::memory::kernel_stack::KernelStack,
+  ) -> Result<CreatedThread, CreateThreadFailure> {
+    match self.create_thread_inner(
+      authority_space,
+      process_handle,
+      affinity,
+      priority,
+      entry,
+      stack,
+    ) {
+      Ok(created) => Ok(created),
+      Err((error, stack)) => Err(CreateThreadFailure { error, stack }),
+    }
+  }
+
+  fn create_thread_inner(
+    &mut self,
+    authority_space: CapabilitySpaceId,
+    process_handle: CapabilityHandle,
+    affinity: u64,
+    priority: u8,
+    entry: usize,
+    stack: crate::memory::kernel_stack::KernelStack,
+  ) -> Result<CreatedThread, (Error, crate::memory::kernel_stack::KernelStack)> {
+    let authority = match self.spaces.get(authority_space) {
+      Ok(space) => space,
+      Err(error) => return Err((Error::CapabilitySpace(error), stack)),
+    };
+    let process_id = match authority.lookup(process_handle, ObjectType::Process, Rights::CREATE) {
+      Ok(id) => id,
+      Err(error) => return Err((Error::Capability(error), stack)),
+    };
+
+    let process = match self.objects.get(process_id) {
+      Ok(KernelObject::Process(process)) => process,
+      Ok(_) => return Err((Error::Object(object::Error::WrongObjectType), stack)),
+      Err(error) => return Err((Error::Object(error), stack)),
+    };
+    if process.state() != ProcessState::Alive {
+      return Err((Error::ProcessNotAlive, stack));
+    }
+    if let Err(error) = process.can_charge(THREAD_CHARGE) {
+      return Err((Error::Process(error), stack));
+    }
+    let owner_space = process.capability_space();
+
+    if !self.objects.has_free_slot() {
+      return Err((Error::Object(object::Error::TableFull), stack));
+    }
+    let owner_capabilities = match self.spaces.get(owner_space) {
+      Ok(space) => space,
+      Err(error) => return Err((Error::CapabilitySpace(error), stack)),
+    };
+    if !owner_capabilities.has_free_slot() {
+      return Err((
+        Error::Capability(crate::capability::Error::SpaceFull),
+        stack,
+      ));
+    }
+    let node = match self.next_node() {
+      Ok(node) => node,
+      Err(error) => return Err((error, stack)),
+    };
+    if self.next_capability_node.checked_add(1).is_none() {
+      return Err((Error::NodeExhausted, stack));
+    }
+
+    let mut thread = match Thread::new(process_id, affinity, priority) {
+      Ok(thread) => thread,
+      Err(error) => return Err((Error::Thread(error), stack)),
+    };
+    if let Err(failuer) = thread.install_execution(stack, entry) {
+      let (error, stack) = failuer.into_parts();
+      return Err((Error::Thread(error), stack));
+    }
+
+    self
+      .objects
+      .get_mut(process_id)
+      .unwrap_or_else(|_| panic!("preflighted owner process disappered"))
+      .as_process_mut()
+      .unwrap_or_else(|| panic!("preflighted owner object changed type"))
+      .charge(THREAD_CHARGE)
+      .unwrap_or_else(|_| panic!("preflighted thread quota commit failed"));
+
+    let thread_id = self
+      .objects
+      .insert(KernelObject::Thread(thread))
+      .unwrap_or_else(|_| panic!("preflighted thread object insertion failed"));
+    let handle = self
+      .spaces
+      .get_mut(owner_space)
+      .unwrap_or_else(|_| panic!("preflighted owner capability space disappeared"))
+      .insert_initial(thread_id, ObjectType::Thread, THREAD_OWNER_RIGHTS, node)
+      .unwrap_or_else(|_| panic!("preflighted thread capability insertion failed"));
+    self
+      .objects
+      .add_capability_reference(thread_id)
+      .unwrap_or_else(|_| panic!("new thread reference increment failed"));
+    self
+      .commit_node()
+      .unwrap_or_else(|_| panic!("preflighted node commit failed"));
+
+    Ok(CreatedThread {
+      object: thread_id,
+      capability: handle,
+    })
+  }
+
   #[cfg(test)]
   fn insert_test_object(&mut self, object: KernelObject) -> Result<ObjectId, Error> {
     Ok(self.objects.insert(object)?)
@@ -474,6 +607,41 @@ impl KernelState {
 impl Default for KernelState {
   fn default() -> Self {
     Self::new()
+  }
+}
+
+const THREAD_OWNER_RIGHTS: Rights = Rights::READ
+  .union(Rights::WRITE)
+  .union(Rights::TRANSFER)
+  .union(Rights::GRANT)
+  .union(Rights::REVOKE)
+  .union(Rights::DESTROY);
+
+const THREAD_CHARGE: ResourceCharge = ResourceCharge {
+  threads: 1,
+  pages: 0,
+  capability_slots: 1,
+  ipc_queue_capacity: 0,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreatedThread {
+  pub object: ObjectId,
+  pub capability: CapabilityHandle,
+}
+
+pub struct CreateThreadFailure {
+  error: Error,
+  stack: crate::memory::kernel_stack::KernelStack,
+}
+
+impl CreateThreadFailure {
+  pub const fn error(&self) -> Error {
+    self.error
+  }
+
+  pub fn into_parts(self) -> (Error, crate::memory::kernel_stack::KernelStack) {
+    (self.error, self.stack)
   }
 }
 
@@ -509,6 +677,38 @@ pub fn initialize_scheduler_state(online_mask: u64) -> Result<(u64, usize, usize
   state.scheduler_summary()
 }
 
+#[cfg(target_arch = "riscv64")]
+pub fn create_thread(
+  authority_space: CapabilitySpaceId,
+  process_handle: CapabilityHandle,
+  affinity: u64,
+  priority: u8,
+  entry: usize,
+) -> Result<CreatedThread, Error> {
+  let stack = crate::memory::kernel_stack::KernelStack::allocate().map_err(Error::KernelStack)?;
+  let result = {
+    let mut state = KERNEL_STATE.lock();
+    state.create_thread_in_space(
+      authority_space,
+      process_handle,
+      affinity,
+      priority,
+      entry,
+      stack,
+    )
+  };
+  match result {
+    Ok(created) => Ok(created),
+    Err(failure) => {
+      let (error, stack) = failure.into_parts();
+      stack
+        .release()
+        .unwrap_or_else(|_| panic!("failed Thread creation stack release"));
+      Err(error)
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use crate::object::MemoryObject;
@@ -519,6 +719,23 @@ mod tests {
 
   fn memory() -> KernelObject {
     KernelObject::Memory(MemoryObject::new(0x8080_0000).unwrap())
+  }
+
+  fn initialize_thread_creation_state(
+    state: &mut KernelState,
+    max_threads: u16,
+  ) -> (CapabilityHandle, CapabilitySpaceId) {
+    let owner_space = state.create_capability_space().unwrap();
+    let mut process = Process::new(
+      ObjectId::from_raw_parts(80, 1),
+      owner_space,
+      ProcessLimits::new(max_threads, 4, 8, 8).unwrap(),
+    );
+    process.start().unwrap();
+    let handle = state
+      .create_object_with_capability(KernelObject::Process(process), Rights::CREATE)
+      .unwrap();
+    (handle, owner_space)
   }
 
   fn scheduler_state(state: &mut KernelState) -> (ObjectId, ObjectId) {
@@ -532,7 +749,13 @@ mod tests {
     let process = state
       .insert_test_object(KernelObject::Process(process))
       .unwrap();
-    let thread = Thread::new(process, 0b0101, 8).unwrap();
+    let mut thread = Thread::new(process, 0b0101, 8).unwrap();
+    thread
+      .install_execution(
+        crate::memory::kernel_stack::kernel_stack_for_test(0x9100_0000),
+        0x8020_0000,
+      )
+      .unwrap_or_else(|_| panic!("test execution installation failed"));
     let thread = state
       .insert_test_object(KernelObject::Thread(thread))
       .unwrap();
@@ -928,6 +1151,142 @@ mod tests {
       .begin_stop()
       .unwrap();
     assert_eq!(state.wake_thread(thread), Err(Error::ProcessNotAlive));
+    assert_eq!(state.scheduler.total_runnable(), 0);
+    assert_eq!(
+      state
+        .objects
+        .get(thread)
+        .unwrap()
+        .as_thread()
+        .unwrap()
+        .state(),
+      ThreadState::New
+    );
+  }
+
+  #[test]
+  fn thread_create_001_commits_quota_object_and_capability_together() {
+    let mut state = KernelState::new();
+    let (process, owner_space) = initialize_thread_creation_state(&mut state, 2);
+    let before_objects = state.object_count();
+    let created = state
+      .create_thread_in_space(
+        state.bootstrap_space(),
+        process,
+        1,
+        8,
+        0x8020_0000,
+        crate::memory::kernel_stack::kernel_stack_for_test(0x9200_0000),
+      )
+      .unwrap_or_else(|_| panic!("Thread creation failed"));
+
+    assert_eq!(state.object_count(), before_objects + 1);
+    assert!(
+      state
+        .lookup_in_space(
+          owner_space,
+          created.capability,
+          ObjectType::Thread,
+          Rights::READ,
+        )
+        .is_ok()
+    );
+    assert!(
+      state
+        .objects
+        .get(created.object)
+        .unwrap()
+        .as_thread()
+        .unwrap()
+        .has_execution()
+    );
+  }
+
+  #[test]
+  fn thread_create_002_quota_failure_returns_stack_without_partial_state() {
+    let mut state = KernelState::new();
+    let (process, _) = initialize_thread_creation_state(&mut state, 1);
+    let first = state
+      .create_thread_in_space(
+        state.bootstrap_space(),
+        process,
+        1,
+        8,
+        0x8020_0000,
+        crate::memory::kernel_stack::kernel_stack_for_test(0x9200_0000),
+      )
+      .unwrap_or_else(|_| panic!("first Thread creation failed"));
+    assert!(state.objects.get(first.object).is_ok());
+    let before = state.object_count();
+
+    let failure = state
+      .create_thread_in_space(
+        state.bootstrap_space(),
+        process,
+        1,
+        8,
+        0x8020_0000,
+        crate::memory::kernel_stack::kernel_stack_for_test(0x9201_0000),
+      )
+      .expect_err("quota must reject second Thread");
+    assert!(matches!(
+      failure.error(),
+      Error::Process(crate::process::Error::ResourceLimit)
+    ));
+    assert_eq!(failure.into_parts().1.base(), 0x9201_0000);
+    assert_eq!(state.object_count(), before);
+  }
+
+  #[test]
+  fn thread_create_003_create_right_is_required() {
+    let mut state = KernelState::new();
+    let owner_space = state.create_capability_space().unwrap();
+    let mut process = Process::new(
+      ObjectId::from_raw_parts(80, 1),
+      owner_space,
+      ProcessLimits::new(2, 4, 8, 8).unwrap(),
+    );
+    process.start().unwrap();
+    let handle = state
+      .create_object_with_capability(KernelObject::Process(process), Rights::READ)
+      .unwrap();
+    let failure = state
+      .create_thread_in_space(
+        state.bootstrap_space(),
+        handle,
+        1,
+        8,
+        0x8020_0000,
+        crate::memory::kernel_stack::kernel_stack_for_test(0x9200_0000),
+      )
+      .expect_err("READ must not authorize Thread creation");
+    assert!(matches!(failure.error(), Error::Capability(_)));
+    assert_eq!(failure.into_parts().1.base(), 0x9200_0000);
+  }
+
+  #[test]
+  fn sched_025_executionless_thread_cannot_wake() {
+    let mut state = KernelState::new();
+    state.initialize_scheduler(0b1111).unwrap();
+    let mut process = Process::new(
+      ObjectId::from_raw_parts(90, 1),
+      state.bootstrap_space(),
+      ProcessLimits::new(4, 4, 8, 8).unwrap(),
+    );
+    process.start().unwrap();
+    let process = state
+      .insert_test_object(KernelObject::Process(process))
+      .unwrap();
+    let thread = state
+      .insert_test_object(KernelObject::Thread(
+        Thread::new(process, 0b0101, 8).unwrap(),
+      ))
+      .unwrap();
+
+    assert_eq!(
+      state.wake_thread(thread),
+      Err(Error::Thread(crate::thread::Error::ExecutionMissing))
+    );
     assert_eq!(state.scheduler.total_runnable(), 0);
     assert_eq!(
       state

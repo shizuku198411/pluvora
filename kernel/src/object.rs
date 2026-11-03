@@ -272,6 +272,10 @@ impl ObjectTable {
     self.live
   }
 
+  pub(crate) fn has_free_slot(&self) -> bool {
+    self.slots.iter().any(|slot| slot.object.is_none())
+  }
+
   fn slot_mut(&mut self, id: ObjectId) -> Result<&mut ObjectSlot, Error> {
     let slot = self.slots.get_mut(id.slot()).ok_or(Error::InvalidObject)?;
     if slot.generation != id.generation() || slot.object.is_none() {
