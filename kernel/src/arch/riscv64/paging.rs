@@ -243,7 +243,7 @@ impl<'allocator, 'memory> Mapper<'allocator, 'memory> {
     if !virtual_address.is_multiple_of(PAGE_SIZE) || !physical_address.is_multiple_of(PAGE_SIZE) {
       return Err(Error::InvalidRegion);
     }
-    if !is_sv39_canonical(virtual_address) {
+    if !is_sv39_address(virtual_address) {
       return Err(Error::InvalidVirtualAddress);
     }
     if physical_address >> PAGE_SHIFT > SATP_PPN_MASK {
@@ -343,7 +343,7 @@ fn vpn_indices(virtual_address: u64) -> [usize; 3] {
   ]
 }
 
-fn is_sv39_canonical(address: u64) -> bool {
+pub const fn is_sv39_address(address: u64) -> bool {
   let sign = (address >> 38) & 1;
   let upper = address >> 39;
   upper == if sign == 0 { 0 } else { (1 << 25) - 1 }
@@ -372,7 +372,7 @@ pub fn satp_value_for(root_frame: u64, asid: u16) -> Result<u64, Error> {
 }
 
 pub fn is_valid_page_address(virtual_address: u64) -> bool {
-  virtual_address.is_multiple_of(PAGE_SIZE) && is_sv39_canonical(virtual_address)
+  virtual_address.is_multiple_of(PAGE_SIZE) && is_sv39_address(virtual_address)
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -429,18 +429,18 @@ mod tests {
 
   #[test]
   fn vm_001_lower_sv39_address_is_canonical() {
-    assert!(is_sv39_canonical(0x0000_003f_ffff_ffff));
+    assert!(is_sv39_address(0x0000_003f_ffff_ffff));
   }
 
   #[test]
   fn vm_002_upper_sv39_address_is_canonical() {
-    assert!(is_sv39_canonical(0xffff_ffc0_0000_0000));
+    assert!(is_sv39_address(0xffff_ffc0_0000_0000));
   }
 
   #[test]
   fn vm_003_invalid_sign_extension_is_rejected() {
-    assert!(!is_sv39_canonical(0x0000_0040_0000_0000));
-    assert!(!is_sv39_canonical(0xffff_ffbf_ffff_ffff));
+    assert!(!is_sv39_address(0x0000_0040_0000_0000));
+    assert!(!is_sv39_address(0xffff_ffbf_ffff_ffff));
   }
 
   #[test]

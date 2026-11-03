@@ -23,6 +23,37 @@ const INTERRUPT_SUPERVISOR_SOFTWARE: usize = 1;
 const INTERRUPT_SUPERVISOR_TIMER: usize = 5;
 const INTERRUPT_SUPERVISOR_EXTERNAL: usize = 9;
 
+const SSTATUS_SIE: usize = 1 << 1;
+const SSTATUS_SPIE: usize = 1 << 5;
+const SSTATUS_SPP: usize = 1 << 8;
+const SSTATUS_SUM: usize = 1 << 18;
+const SSTATUS_MXR: usize = 1 << 19;
+const SSTATUS_UXL_SHIFT: usize = 32;
+const SSTATUS_UXL_64: usize = 0b10 << SSTATUS_UXL_SHIFT;
+
+pub const USER_STACK_ALIGNMENT: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrivilegeMode {
+  User,
+  Supervisor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserContextError {
+  InvalidEntry,
+  InvalidStackPointer,
+}
+
+impl UserContextError {
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::InvalidEntry => "invalid user entry address",
+      Self::InvalidStackPointer => "invalid user stack pointer",
+    }
+  }
+}
+
 #[repr(C)]
 pub struct TrapFrame {
   registers: [usize; 32],
@@ -33,6 +64,32 @@ pub struct TrapFrame {
 }
 
 impl TrapFrame {
+  pub fn initial_user(entry: usize, stack_pointer: usize) -> Result<Self, UserContextError> {
+    if entry == 0 || !crate::arch::riscv64::paging::is_sv39_address(entry as u64) {
+      return Err(UserContextError::InvalidEntry);
+    }
+    if stack_pointer == 0
+      || !stack_pointer.is_multiple_of(USER_STACK_ALIGNMENT)
+      || !crate::arch::riscv64::paging::is_sv39_address(stack_pointer as u64)
+    {
+      return Err(UserContextError::InvalidStackPointer);
+    }
+
+    let mut registers = [0; 32];
+    registers[2] = stack_pointer;
+    Ok(Self {
+      registers,
+      sstatus: initial_user_sstatus(),
+      sepc: entry,
+      scause: 0,
+      stval: 0,
+    })
+  }
+
+  pub const fn privilege_mode(&self) -> PrivilegeMode {
+    privilege_mode_from_sstatus(self.sstatus)
+  }
+
   pub const fn stack_pointer(&self) -> usize {
     self.registers[2]
   }
@@ -51,6 +108,20 @@ impl TrapFrame {
 
   pub const fn stval(&self) -> usize {
     self.stval
+  }
+}
+
+const fn initial_user_sstatus() -> usize {
+  let mut status = SSTATUS_SPIE | SSTATUS_UXL_64;
+  status &= !(SSTATUS_SIE | SSTATUS_SPP | SSTATUS_SUM | SSTATUS_MXR);
+  status
+}
+
+const fn privilege_mode_from_sstatus(sstatus: usize) -> PrivilegeMode {
+  if sstatus & SSTATUS_SPP == 0 {
+    PrivilegeMode::User
+  } else {
+    PrivilegeMode::Supervisor
   }
 }
 
@@ -297,5 +368,72 @@ mod tests {
     assert_eq!(offset_of!(TrapFrame, sepc), 33 * 8);
     assert_eq!(offset_of!(TrapFrame, scause), 34 * 8);
     assert_eq!(offset_of!(TrapFrame, stval), 35 * 8);
+  }
+
+  #[test]
+  fn trap_011_initial_user_frame_has_least_privilege_state() {
+    let frame = TrapFrame::initial_user(0x1000, 0x8000).unwrap();
+    assert_eq!(frame.privilege_mode(), PrivilegeMode::User);
+    assert_eq!(frame.sepc(), 0x1000);
+    assert_eq!(frame.stack_pointer(), 0x8000);
+    assert_eq!(frame.scause(), 0);
+    assert_eq!(frame.stval(), 0);
+    assert_eq!(frame.sstatus() & SSTATUS_SPIE, SSTATUS_SPIE);
+    assert_eq!(
+      frame.sstatus() & (0b11 << SSTATUS_UXL_SHIFT),
+      SSTATUS_UXL_64
+    );
+    assert_eq!(
+      frame.sstatus() & (SSTATUS_SIE | SSTATUS_SPP | SSTATUS_SUM | SSTATUS_MXR),
+      0
+    );
+    assert!(
+      frame
+        .registers
+        .iter()
+        .enumerate()
+        .all(|(index, value)| index == 2 || *value == 0)
+    );
+  }
+
+  #[test]
+  fn trap_012_user_entry_must_be_nonzero_and_canonical() {
+    assert!(matches!(
+      TrapFrame::initial_user(0, 0x8000),
+      Err(UserContextError::InvalidEntry)
+    ));
+    assert!(matches!(
+      TrapFrame::initial_user(0x0000_0040_0000_0000, 0x8000),
+      Err(UserContextError::InvalidEntry)
+    ));
+  }
+
+  #[test]
+  fn trap_013_user_stack_must_be_aligned_and_canonical() {
+    assert!(matches!(
+      TrapFrame::initial_user(0x1000, 0),
+      Err(UserContextError::InvalidStackPointer)
+    ));
+    assert!(matches!(
+      TrapFrame::initial_user(0x1000, 0x8008),
+      Err(UserContextError::InvalidStackPointer)
+    ));
+    assert!(matches!(
+      TrapFrame::initial_user(0x1000, 0x0000_0040_0000_0000),
+      Err(UserContextError::InvalidStackPointer)
+    ));
+  }
+
+  #[test]
+  fn trap_014_spp_is_the_trap_origin_authority() {
+    assert_eq!(privilege_mode_from_sstatus(0), PrivilegeMode::User);
+    assert_eq!(
+      privilege_mode_from_sstatus(SSTATUS_SPIE | SSTATUS_SUM),
+      PrivilegeMode::User
+    );
+    assert_eq!(
+      privilege_mode_from_sstatus(SSTATUS_SPP),
+      PrivilegeMode::Supervisor
+    );
   }
 }
