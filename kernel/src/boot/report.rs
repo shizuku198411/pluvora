@@ -134,6 +134,18 @@ pub fn memory_object(object: crate::object::ObjectId, capability: CapabilityHand
   console::write_line("  Process quota     : charged");
 }
 
+pub fn user_mapping(mapped: crate::kernel_state::MappedMemory) {
+  section("Capability User Mapping");
+  usize_field("Memory identity", mapped.memory.into_raw());
+  usize_field("Address identity", mapped.address_space.into_raw());
+  u64_field("Virtual address", mapped.virtual_address);
+  console::write_line("  Permissions       : read-write");
+  console::write_line("  Memory authority  : MAP + READ + WRITE");
+  console::write_line("  Address authority : MAP");
+  console::write_line("  Mapping reference : held");
+  console::write_line("  User PTE          : published last");
+}
+
 pub fn runtime_memory(free_frames: usize, stack_top: usize) {
   section("Runtime Memory");
   usize_field("Free frames", free_frames);

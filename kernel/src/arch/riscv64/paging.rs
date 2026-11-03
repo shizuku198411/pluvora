@@ -87,6 +87,16 @@ pub enum UserPermissions {
 }
 
 impl UserPermissions {
+  pub const fn required_rights(self) -> crate::capability::Rights {
+    match self {
+      Self::ReadOnly => crate::capability::Rights::READ,
+      Self::ReadWrite => crate::capability::Rights::READ.union(crate::capability::Rights::WRITE),
+      Self::ReadExecute => {
+        crate::capability::Rights::READ.union(crate::capability::Rights::EXECUTE)
+      }
+    }
+  }
+
   pub(crate) const fn pte_flags(self) -> u64 {
     let access = match self {
       Self::ReadOnly => PTE_READ | PTE_ACCESSED,
@@ -494,6 +504,21 @@ mod tests {
       assert_ne!(flags & PTE_READ, 0);
       assert_ne!(flags & (PTE_WRITE | PTE_EXECUTE), PTE_WRITE | PTE_EXECUTE);
     }
+  }
+
+  #[test]
+  fn vm_010_user_permissions_require_matching_capability_rights() {
+    use crate::capability::Rights;
+
+    assert_eq!(UserPermissions::ReadOnly.required_rights(), Rights::READ);
+    assert_eq!(
+      UserPermissions::ReadWrite.required_rights(),
+      Rights::READ.union(Rights::WRITE)
+    );
+    assert_eq!(
+      UserPermissions::ReadExecute.required_rights(),
+      Rights::READ.union(Rights::EXECUTE)
+    );
   }
 
   #[test]

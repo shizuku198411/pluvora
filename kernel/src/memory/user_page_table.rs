@@ -8,7 +8,7 @@ use crate::memory::{PAGE_SIZE, frame_allocator};
 
 pub const USER_WINDOW_START: u64 = PAGE_SIZE;
 pub const USER_WINDOW_END: u64 = 1 << 30;
-pub const MAX_OWNED_PAGE_TABLE_FRAMES: usize = 16;
+pub const MAX_OWNED_PAGE_TABLE_FRAMES: usize = 3;
 
 const USER_ROOT_INDEX: usize = 0;
 
@@ -22,6 +22,8 @@ pub enum Error {
   AlreadyMapped,
   LeafWhereTableExpected,
   TableFrameLimit,
+  MappingLimit,
+  KernelAddressSpace,
 }
 
 impl Error {
@@ -35,7 +37,67 @@ impl Error {
       Self::AlreadyMapped => "user virtual page is already mapped",
       Self::LeafWhereTableExpected => "user page-table walk found an upper-level leaf",
       Self::TableFrameLimit => "user page-table frame limit reached",
+      Self::MappingLimit => "user Address Space mapping limit reached",
+      Self::KernelAddressSpace => "kernel Address Space cannot receive a user mapping",
     }
+  }
+}
+
+pub struct PreparedMappingFrames {
+  level_one: frame_allocator::FrameBlock,
+  level_zero: frame_allocator::FrameBlock,
+}
+
+impl PreparedMappingFrames {
+  #[cfg(target_arch = "riscv64")]
+  pub fn allocate() -> Result<Self, Error> {
+    let level_one = frame_allocator::allocate(1)?;
+    let level_zero = match frame_allocator::allocate(1) {
+      Ok(frame) => frame,
+      Err(error) => {
+        frame_allocator::release(level_one)
+          .unwrap_or_else(|_| panic!("failed prepared mapping rollback"));
+        return Err(Error::Allocator(error));
+      }
+    };
+    Ok(Self {
+      level_one,
+      level_zero,
+    })
+  }
+
+  #[cfg(target_arch = "riscv64")]
+  pub fn release(self) -> Result<(), Error> {
+    frame_allocator::release(self.level_zero)?;
+    frame_allocator::release(self.level_one)?;
+    Ok(())
+  }
+
+  #[cfg(test)]
+  pub(crate) fn for_test(level_one: u64, level_zero: u64) -> Self {
+    Self {
+      level_one: frame_allocator::frame_block_for_test(level_one, 1),
+      level_zero: frame_allocator::frame_block_for_test(level_zero, 1),
+    }
+  }
+}
+
+pub struct MappingFailure {
+  error: Error,
+  frames: PreparedMappingFrames,
+}
+
+impl MappingFailure {
+  pub(crate) const fn new(error: Error, frames: PreparedMappingFrames) -> Self {
+    Self { error, frames }
+  }
+
+  pub const fn error(&self) -> Error {
+    self.error
+  }
+
+  pub fn into_parts(self) -> (Error, PreparedMappingFrames) {
+    (self.error, self.frames)
   }
 }
 
@@ -107,33 +169,39 @@ impl UserPageTable {
     virtual_address: u64,
     physical_address: u64,
     permissions: UserPermissions,
-  ) -> Result<(), Error> {
-    validate_user_page(virtual_address)?;
-    validate_physical_page(physical_address)?;
+    frames: PreparedMappingFrames,
+  ) -> Result<(), MappingFailure> {
+    if let Err(error) = validate_user_page(virtual_address) {
+      return Err(MappingFailure::new(error, frames));
+    }
+    if let Err(error) = validate_physical_page(physical_address) {
+      return Err(MappingFailure::new(error, frames));
+    }
+    if self.mapped_pages != 0 {
+      return Err(MappingFailure::new(Error::MappingLimit, frames));
+    }
+    if self.owned_len + 2 > MAX_OWNED_PAGE_TABLE_FRAMES {
+      return Err(MappingFailure::new(Error::TableFrameLimit, frames));
+    }
 
     let indices = paging::vpn_indices(virtual_address);
-    let root_entry = read_entry(self.root_frame, indices[2])?;
+    let root_entry = match read_entry(self.root_frame, indices[2]) {
+      Ok(entry) => entry,
+      Err(error) => return Err(MappingFailure::new(error, frames)),
+    };
     if root_entry & PTE_VALID != 0 {
-      return Err(if paging::is_leaf(root_entry) {
+      let error = if paging::is_leaf(root_entry) {
         Error::LeafWhereTableExpected
       } else {
         Error::AlreadyMapped
-      });
+      };
+      return Err(MappingFailure::new(error, frames));
     }
 
-    if self.owned_len + 2 > MAX_OWNED_PAGE_TABLE_FRAMES {
-      return Err(Error::TableFrameLimit);
-    }
-
-    let level_one = frame_allocator::allocate(1)?;
-    let level_zero = match frame_allocator::allocate(1) {
-      Ok(block) => block,
-      Err(error) => {
-        frame_allocator::release(level_one)
-          .unwrap_or_else(|_| panic!("failed user page-table allocation rollback"));
-        return Err(Error::Allocator(error));
-      }
-    };
+    let PreparedMappingFrames {
+      level_one,
+      level_zero,
+    } = frames;
 
     write_entry(
       level_one.start(),
@@ -290,5 +358,15 @@ mod tests {
       assert_ne!(flags & paging::PTE_USER, 0);
       assert_ne!(flags & (WRITE | EXECUTE), WRITE | EXECUTE);
     }
+  }
+
+  #[test]
+  fn uas_007_mapping_failure_returns_prepared_frame_ownership() {
+    let frames = PreparedMappingFrames::for_test(0x8100_0000, 0x8100_1000);
+    let failure = MappingFailure::new(Error::InvalidVirtualAddress, frames);
+    let (error, frames) = failure.into_parts();
+    assert_eq!(error, Error::InvalidVirtualAddress);
+    assert_eq!(frames.level_one.start(), 0x8100_0000);
+    assert_eq!(frames.level_zero.start(), 0x8100_1000);
   }
 }

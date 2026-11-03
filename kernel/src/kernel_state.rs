@@ -33,6 +33,10 @@ pub enum Error {
   Process(crate::process::Error),
   KernelStack(crate::memory::kernel_stack::Error),
   FrameAllocator(crate::memory::frame_allocator::Error),
+  UserPageTable(crate::memory::user_page_table::Error),
+  #[cfg(target_arch = "riscv64")]
+  AddressSpaceAllocator(crate::memory::address_space::AllocatorError),
+  AddressSpaceBusy,
   Hart(crate::arch::riscv64::hart::Error),
   KernelAddressSpaceUninitialized,
   RollbackFailed,
@@ -55,6 +59,10 @@ impl Error {
       Self::Process(_) => "process resource accounting failed",
       Self::KernelStack(_) => "kernel stack operation failed",
       Self::FrameAllocator(_) => "runtime frame allocation failed",
+      Self::UserPageTable(error) => error.as_str(),
+      #[cfg(target_arch = "riscv64")]
+      Self::AddressSpaceAllocator(error) => error.as_str(),
+      Self::AddressSpaceBusy => "Address Space may contain stale TLB entries",
       Self::Hart(_) => "hart-local thread operation failed",
       Self::KernelAddressSpaceUninitialized => "kernel Address Space is not initialized",
       Self::RollbackFailed => "kernel state transaction rollback failed",
@@ -541,6 +549,221 @@ impl KernelState {
     }
   }
 
+  #[cfg(target_arch = "riscv64")]
+  pub fn create_user_address_space_in_space(
+    &mut self,
+    authority_space: CapabilitySpaceId,
+    process_handle: CapabilityHandle,
+    table: crate::memory::user_page_table::UserPageTable,
+    asid: Asid,
+  ) -> Result<CreatedAddressSpace, CreateAddressSpaceFailure> {
+    match self.create_user_address_space_inner(authority_space, process_handle, table, asid) {
+      Ok(created) => Ok(created),
+      Err((error, table)) => Err(CreateAddressSpaceFailure { error, table }),
+    }
+  }
+
+  #[cfg(target_arch = "riscv64")]
+  fn create_user_address_space_inner(
+    &mut self,
+    authority_space: CapabilitySpaceId,
+    process_handle: CapabilityHandle,
+    table: crate::memory::user_page_table::UserPageTable,
+    asid: Asid,
+  ) -> Result<CreatedAddressSpace, (Error, crate::memory::user_page_table::UserPageTable)> {
+    let authority = match self.spaces.get(authority_space) {
+      Ok(space) => space,
+      Err(error) => return Err((Error::CapabilitySpace(error), table)),
+    };
+    let process_id = match authority.lookup(process_handle, ObjectType::Process, Rights::CREATE) {
+      Ok(id) => id,
+      Err(error) => return Err((Error::Capability(error), table)),
+    };
+    let process = match self.objects.get(process_id) {
+      Ok(KernelObject::Process(process)) => process,
+      Ok(_) => return Err((Error::Object(object::Error::WrongObjectType), table)),
+      Err(error) => return Err((Error::Object(error), table)),
+    };
+    if process.state() != ProcessState::Alive {
+      return Err((Error::ProcessNotAlive, table));
+    }
+    if let Err(error) = process.can_charge(ADDRESS_SPACE_CHARGE) {
+      return Err((Error::Process(error), table));
+    }
+    let owner_space = process.capability_space();
+
+    if !self.objects.has_free_slot() {
+      return Err((Error::Object(object::Error::TableFull), table));
+    }
+    let owner_capabilities = match self.spaces.get(owner_space) {
+      Ok(space) => space,
+      Err(error) => return Err((Error::CapabilitySpace(error), table)),
+    };
+    if !owner_capabilities.has_free_slot() {
+      return Err((
+        Error::Capability(crate::capability::Error::SpaceFull),
+        table,
+      ));
+    }
+    let node = match self.next_node() {
+      Ok(node) => node,
+      Err(error) => return Err((error, table)),
+    };
+    if self.next_capability_node.checked_add(1).is_none() {
+      return Err((Error::NodeExhausted, table));
+    }
+    let root_frame = table.root_frame();
+    if root_frame == 0 || !root_frame.is_multiple_of(crate::memory::PAGE_SIZE) {
+      return Err((
+        Error::AddressSpace(crate::memory::address_space::Error::InvalidRootFrame),
+        table,
+      ));
+    }
+
+    let address_space = AddressSpace::new_user(table, asid)
+      .unwrap_or_else(|_| panic!("preflighted User Address Space became invalid"));
+    self
+      .objects
+      .get_mut(process_id)
+      .unwrap_or_else(|_| panic!("preflighted owner process disappeared"))
+      .as_process_mut()
+      .unwrap_or_else(|| panic!("preflighted owner object changed type"))
+      .charge(ADDRESS_SPACE_CHARGE)
+      .unwrap_or_else(|_| panic!("preflighted Address Space quota commit failed"));
+    let address_space_id = self
+      .objects
+      .insert(KernelObject::AddressSpace(address_space))
+      .unwrap_or_else(|_| panic!("preflighted Address Space insertion failed"));
+    let capability = self
+      .spaces
+      .get_mut(owner_space)
+      .unwrap_or_else(|_| panic!("preflighted owner Capability Space disappeared"))
+      .insert_initial(
+        address_space_id,
+        ObjectType::AddressSpace,
+        ADDRESS_SPACE_OWNER_RIGHTS,
+        node,
+      )
+      .unwrap_or_else(|_| panic!("preflighted Address Space capability insertion failed"));
+    self
+      .objects
+      .add_capability_reference(address_space_id)
+      .unwrap_or_else(|_| panic!("new Address Space reference increment failed"));
+    self
+      .commit_node()
+      .unwrap_or_else(|_| panic!("preflighted node commit failed"));
+
+    Ok(CreatedAddressSpace {
+      object: address_space_id,
+      capability,
+    })
+  }
+
+  #[cfg(target_arch = "riscv64")]
+  pub fn map_memory_in_space(
+    &mut self,
+    authority_space: CapabilitySpaceId,
+    address_space_handle: CapabilityHandle,
+    memory_handle: CapabilityHandle,
+    virtual_address: u64,
+    permissions: crate::arch::riscv64::paging::UserPermissions,
+    frames: crate::memory::user_page_table::PreparedMappingFrames,
+  ) -> Result<MappedMemory, MapMemoryFailure> {
+    match self.map_memory_inner(
+      authority_space,
+      address_space_handle,
+      memory_handle,
+      virtual_address,
+      permissions,
+      frames,
+    ) {
+      Ok(mapped) => Ok(mapped),
+      Err((error, frames)) => Err(MapMemoryFailure { error, frames }),
+    }
+  }
+
+  #[cfg(target_arch = "riscv64")]
+  fn map_memory_inner(
+    &mut self,
+    authority_space: CapabilitySpaceId,
+    address_space_handle: CapabilityHandle,
+    memory_handle: CapabilityHandle,
+    virtual_address: u64,
+    permissions: crate::arch::riscv64::paging::UserPermissions,
+    frames: crate::memory::user_page_table::PreparedMappingFrames,
+  ) -> Result<MappedMemory, (Error, crate::memory::user_page_table::PreparedMappingFrames)> {
+    let capabilities = match self.spaces.get(authority_space) {
+      Ok(space) => space,
+      Err(error) => return Err((Error::CapabilitySpace(error), frames)),
+    };
+    let address_space_id =
+      match capabilities.lookup(address_space_handle, ObjectType::AddressSpace, Rights::MAP) {
+        Ok(id) => id,
+        Err(error) => return Err((Error::Capability(error), frames)),
+      };
+    let required = Rights::MAP.union(permissions.required_rights());
+    let memory_id = match capabilities.lookup(memory_handle, ObjectType::Memory, required) {
+      Ok(id) => id,
+      Err(error) => return Err((Error::Capability(error), frames)),
+    };
+    let physical_address = match self.objects.get(memory_id) {
+      Ok(KernelObject::Memory(memory)) => memory.frame_start(),
+      Ok(_) => return Err((Error::Object(object::Error::WrongObjectType), frames)),
+      Err(error) => return Err((Error::Object(error), frames)),
+    };
+    let address_space = match self.objects.get(address_space_id) {
+      Ok(KernelObject::AddressSpace(space)) => space,
+      Ok(_) => return Err((Error::Object(object::Error::WrongObjectType), frames)),
+      Err(error) => return Err((Error::Object(error), frames)),
+    };
+    if !address_space.is_user() {
+      return Err((
+        Error::UserPageTable(crate::memory::user_page_table::Error::KernelAddressSpace),
+        frames,
+      ));
+    }
+    if address_space.active_harts() != 0 || address_space.resident_harts() != 0 {
+      return Err((Error::AddressSpaceBusy, frames));
+    }
+    if address_space.mapping_count() != 0 {
+      return Err((
+        Error::UserPageTable(crate::memory::user_page_table::Error::MappingLimit),
+        frames,
+      ));
+    }
+    if let Err(error) = self.objects.can_add_mapping_reference(memory_id) {
+      return Err((Error::Object(error), frames));
+    }
+
+    let address_space = self
+      .objects
+      .get_mut(address_space_id)
+      .unwrap_or_else(|_| panic!("preflighted Address Space disappeared"))
+      .as_address_space_mut()
+      .unwrap_or_else(|| panic!("preflighted Address Space changed type"));
+    if let Err(failure) = address_space.map_user_page(
+      memory_id,
+      physical_address,
+      virtual_address,
+      permissions,
+      frames,
+    ) {
+      let (error, frames) = failure.into_parts();
+      return Err((Error::UserPageTable(error), frames));
+    }
+    self
+      .objects
+      .add_mapping_reference(memory_id)
+      .unwrap_or_else(|_| panic!("preflighted mapping reference commit failed"));
+
+    Ok(MappedMemory {
+      memory: memory_id,
+      address_space: address_space_id,
+      virtual_address,
+      permissions,
+    })
+  }
+
   fn create_memory_inner(
     &mut self,
     authority_space: CapabilitySpaceId,
@@ -986,6 +1209,14 @@ const MEMORY_OWNER_RIGHTS: Rights = Rights::READ
   .union(Rights::REVOKE)
   .union(Rights::DESTROY);
 
+#[cfg(target_arch = "riscv64")]
+const ADDRESS_SPACE_OWNER_RIGHTS: Rights = Rights::MAP
+  .union(Rights::SHARE)
+  .union(Rights::TRANSFER)
+  .union(Rights::GRANT)
+  .union(Rights::REVOKE)
+  .union(Rights::DESTROY);
+
 const BOOTSTRAP_PROCESS_RIGHTS: Rights = Rights::READ
   .union(Rights::WRITE)
   .union(Rights::TRANSFER)
@@ -1007,6 +1238,58 @@ const MEMORY_PAGE_CHARGE: ResourceCharge = ResourceCharge {
   capability_slots: 1,
   ipc_queue_capacity: 0,
 };
+
+#[cfg(target_arch = "riscv64")]
+const ADDRESS_SPACE_CHARGE: ResourceCharge = ResourceCharge {
+  threads: 0,
+  pages: 0,
+  capability_slots: 1,
+  ipc_queue_capacity: 0,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreatedAddressSpace {
+  pub object: ObjectId,
+  pub capability: CapabilityHandle,
+}
+
+pub struct CreateAddressSpaceFailure {
+  error: Error,
+  table: crate::memory::user_page_table::UserPageTable,
+}
+
+impl CreateAddressSpaceFailure {
+  pub const fn error(&self) -> Error {
+    self.error
+  }
+
+  pub fn into_parts(self) -> (Error, crate::memory::user_page_table::UserPageTable) {
+    (self.error, self.table)
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MappedMemory {
+  pub memory: ObjectId,
+  pub address_space: ObjectId,
+  pub virtual_address: u64,
+  pub permissions: crate::arch::riscv64::paging::UserPermissions,
+}
+
+pub struct MapMemoryFailure {
+  error: Error,
+  frames: crate::memory::user_page_table::PreparedMappingFrames,
+}
+
+impl MapMemoryFailure {
+  pub const fn error(&self) -> Error {
+    self.error
+  }
+
+  pub fn into_parts(self) -> (Error, crate::memory::user_page_table::PreparedMappingFrames) {
+    (self.error, self.frames)
+  }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CreatedMemory {
@@ -1160,6 +1443,72 @@ pub fn create_memory(
       let (error, frame) = failure.into_parts();
       crate::memory::frame_allocator::release(frame)
         .unwrap_or_else(|_| panic!("failed Memory creation frame release"));
+      Err(error)
+    }
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn create_user_address_space(
+  authority_space: CapabilitySpaceId,
+  process_handle: CapabilityHandle,
+  kernel_root: u64,
+) -> Result<CreatedAddressSpace, Error> {
+  let table = crate::memory::user_page_table::UserPageTable::clone_kernel_root(kernel_root)
+    .map_err(Error::UserPageTable)?;
+  let asid = match crate::memory::address_space::allocate_asid() {
+    Ok(asid) => asid,
+    Err(error) => {
+      table
+        .release()
+        .unwrap_or_else(|_| panic!("failed User Address Space ASID rollback"));
+      return Err(Error::AddressSpaceAllocator(error));
+    }
+  };
+  let result = {
+    let mut state = KERNEL_STATE.lock();
+    state.create_user_address_space_in_space(authority_space, process_handle, table, asid)
+  };
+  match result {
+    Ok(created) => Ok(created),
+    Err(failure) => {
+      let (error, table) = failure.into_parts();
+      table
+        .release()
+        .unwrap_or_else(|_| panic!("failed User Address Space creation rollback"));
+      Err(error)
+    }
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn map_memory(
+  authority_space: CapabilitySpaceId,
+  address_space_handle: CapabilityHandle,
+  memory_handle: CapabilityHandle,
+  virtual_address: u64,
+  permissions: crate::arch::riscv64::paging::UserPermissions,
+) -> Result<MappedMemory, Error> {
+  let frames = crate::memory::user_page_table::PreparedMappingFrames::allocate()
+    .map_err(Error::UserPageTable)?;
+  let result = {
+    let mut state = KERNEL_STATE.lock();
+    state.map_memory_in_space(
+      authority_space,
+      address_space_handle,
+      memory_handle,
+      virtual_address,
+      permissions,
+      frames,
+    )
+  };
+  match result {
+    Ok(mapped) => Ok(mapped),
+    Err(failure) => {
+      let (error, frames) = failure.into_parts();
+      frames
+        .release()
+        .unwrap_or_else(|_| panic!("failed user mapping frame rollback"));
       Err(error)
     }
   }

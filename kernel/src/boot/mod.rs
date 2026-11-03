@@ -137,6 +137,21 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
   let memory = kernel_state::create_memory(kernel_state::bootstrap_space(), process.authority)
     .unwrap_or_else(|error| fail("Memory Object", error.as_str()));
   report::memory_object(memory.object, memory.capability);
+  let user_space = kernel_state::create_user_address_space(
+    kernel_state::bootstrap_space(),
+    process.authority,
+    paging.root_frame(),
+  )
+  .unwrap_or_else(|error| fail("User Mapping", error.as_str()));
+  let mapped = kernel_state::map_memory(
+    process.space,
+    user_space.capability,
+    memory.capability,
+    crate::memory::user_page_table::USER_WINDOW_START,
+    crate::arch::riscv64::paging::UserPermissions::ReadWrite,
+  )
+  .unwrap_or_else(|error| fail("User Mapping", error.as_str()));
+  report::user_mapping(mapped);
   kernel_thread::reset_smoke_state();
   let affinity = 1u64
     .checked_shl(boot_index as u32)

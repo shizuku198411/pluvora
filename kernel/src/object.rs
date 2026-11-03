@@ -113,6 +113,13 @@ impl KernelObject {
     }
   }
 
+  pub fn as_address_space_mut(&mut self) -> Option<&mut AddressSpace> {
+    match self {
+      Self::AddressSpace(space) => Some(space),
+      Self::Memory(_) | Self::Process(_) | Self::Thread(_) => None,
+    }
+  }
+
   pub const fn as_process(&self) -> Option<&Process> {
     match self {
       Self::Process(process) => Some(process),
@@ -156,6 +163,7 @@ pub struct ObjectSlot {
   generation: u32,
   object: Option<KernelObject>,
   capability_references: usize,
+  mapping_references: usize,
 }
 
 impl ObjectSlot {
@@ -164,6 +172,7 @@ impl ObjectSlot {
       generation: 1,
       object: None,
       capability_references: 0,
+      mapping_references: 0,
     }
   }
 }
@@ -199,6 +208,7 @@ impl ObjectTable {
       .ok_or(Error::TableFull)?;
 
     debug_assert_eq!(slot.capability_references, 0);
+    debug_assert_eq!(slot.mapping_references, 0);
     slot.object = Some(object);
     self.live = self.live.checked_add(1).ok_or(Error::ReferenceOverflow)?;
 
@@ -254,9 +264,39 @@ impl ObjectTable {
     Ok(())
   }
 
+  pub(crate) fn can_add_mapping_reference(&self, id: ObjectId) -> Result<(), Error> {
+    self
+      .mapping_references(id)?
+      .checked_add(1)
+      .map(|_| ())
+      .ok_or(Error::ReferenceOverflow)
+  }
+
+  pub(crate) fn add_mapping_reference(&mut self, id: ObjectId) -> Result<(), Error> {
+    let slot = self.slot_mut(id)?;
+    slot.mapping_references = slot
+      .mapping_references
+      .checked_add(1)
+      .ok_or(Error::ReferenceOverflow)?;
+    Ok(())
+  }
+
+  #[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "unmap will release mapping references")
+  )]
+  pub(crate) fn remove_mapping_reference(&mut self, id: ObjectId) -> Result<(), Error> {
+    let slot = self.slot_mut(id)?;
+    slot.mapping_references = slot
+      .mapping_references
+      .checked_sub(1)
+      .ok_or(Error::ReferenceUnderflow)?;
+    Ok(())
+  }
+
   pub(crate) fn rollback_unreferenced_insert(&mut self, id: ObjectId) -> Result<(), Error> {
     let slot = self.slot_mut(id)?;
-    if slot.capability_references != 0 {
+    if slot.capability_references != 0 || slot.mapping_references != 0 {
       return Err(Error::InvalidObject);
     }
     slot.object.take().ok_or(Error::InvalidObject)?;
@@ -270,6 +310,14 @@ impl ObjectTable {
       return Err(Error::InvalidObject);
     }
     Ok(slot.capability_references)
+  }
+
+  pub(crate) fn mapping_references(&self, id: ObjectId) -> Result<usize, Error> {
+    let slot = self.slots.get(id.slot()).ok_or(Error::InvalidObject)?;
+    if slot.generation != id.generation() || slot.object.is_none() {
+      return Err(Error::InvalidObject);
+    }
+    Ok(slot.mapping_references)
   }
 
   pub const fn live_count(&self) -> usize {
@@ -373,6 +421,28 @@ mod tests {
       table.remove_capability_reference(id),
       Err(Error::ReferenceUnderflow)
     );
+  }
+
+  #[test]
+  fn obj_008_mapping_reference_is_independent_from_capability_reference() {
+    let mut table = ObjectTable::new();
+    let id = table
+      .insert(KernelObject::Memory(memory_object_for_test(0x8060_0000)))
+      .unwrap();
+    assert_eq!(table.can_add_mapping_reference(id), Ok(()));
+    table.add_capability_reference(id).unwrap();
+    table.add_mapping_reference(id).unwrap();
+    assert_eq!(table.capability_references(id), Ok(1));
+    assert_eq!(table.mapping_references(id), Ok(1));
+    table.remove_capability_reference(id).unwrap();
+    assert_eq!(table.capability_references(id), Ok(0));
+    assert_eq!(table.mapping_references(id), Ok(1));
+    assert_eq!(
+      table.rollback_unreferenced_insert(id),
+      Err(Error::InvalidObject)
+    );
+    table.remove_mapping_reference(id).unwrap();
+    assert_eq!(table.mapping_references(id), Ok(0));
   }
 
   #[test]
