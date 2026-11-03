@@ -36,6 +36,8 @@ pub enum Error {
   InvalidHartIndex,
   CurrentThreadBusy,
   CurrentThreadMismatch,
+  PendingYieldBusy,
+  PendingYieldMismatch,
   InvalidStackLayout,
   InvalidSatp,
   HartIdMismatch,
@@ -50,6 +52,8 @@ impl Error {
       Self::InvalidHartIndex => "invalid dense hart index",
       Self::CurrentThreadBusy => "hart already has a current thread",
       Self::CurrentThreadMismatch => "hart current thread identity does not match",
+      Self::PendingYieldBusy => "hart already has a pending yield",
+      Self::PendingYieldMismatch => "hart pending yield identity does not match",
       Self::InvalidStackLayout => "invalid secondary stack layout",
       Self::InvalidSatp => "satp value does not fit the target register",
       Self::HartIdMismatch => "secondary hart ID does not match boot descriptor",
@@ -72,6 +76,7 @@ pub struct HartLocal {
   dense_index: AtomicUsize,
   state: AtomicUsize,
   current_thread: AtomicUsize,
+  pending_yield: AtomicUsize,
   interrupt_disable_depth: AtomicUsize,
   restore_interrupts: AtomicBool,
   preemption_disable_depth: AtomicUsize,
@@ -88,6 +93,7 @@ impl HartLocal {
       dense_index: AtomicUsize::new(usize::MAX),
       state: AtomicUsize::new(HART_OFFLINE),
       current_thread: AtomicUsize::new(0),
+      pending_yield: AtomicUsize::new(0),
       interrupt_disable_depth: AtomicUsize::new(0),
       restore_interrupts: AtomicBool::new(false),
       preemption_disable_depth: AtomicUsize::new(0),
@@ -180,6 +186,26 @@ impl HartLocal {
       .compare_exchange(expected.into_raw(), 0, Ordering::AcqRel, Ordering::Acquire)
       .map(|_| ())
       .map_err(|_| Error::CurrentThreadMismatch)
+  }
+
+  pub(crate) fn pending_yield(&self) -> Option<ObjectId> {
+    ObjectId::from_raw(self.pending_yield.load(Ordering::Acquire))
+  }
+
+  pub(crate) fn install_pending_yield(&self, thread: ObjectId) -> Result<(), Error> {
+    self
+      .pending_yield
+      .compare_exchange(0, thread.into_raw(), Ordering::AcqRel, Ordering::Acquire)
+      .map(|_| ())
+      .map_err(|_| Error::PendingYieldBusy)
+  }
+
+  pub(crate) fn clear_pending_yield(&self, expected: ObjectId) -> Result<(), Error> {
+    self
+      .pending_yield
+      .compare_exchange(expected.into_raw(), 0, Ordering::AcqRel, Ordering::Acquire)
+      .map(|_| ())
+      .map_err(|_| Error::PendingYieldMismatch)
   }
 }
 
@@ -699,5 +725,24 @@ mod tests {
     assert_eq!(local.current_thread(), Some(first));
     assert_eq!(local.clear_current_thread(first), Ok(()));
     assert_eq!(local.current_thread(), None);
+  }
+
+  #[test]
+  fn sched_031_pending_yield_preserves_identity_until_expected_clear() {
+    let local = HartLocal::empty();
+    let thread = ObjectId::from_raw_parts(4, 7);
+    let other = ObjectId::from_raw_parts(5, 2);
+    assert_eq!(local.install_pending_yield(thread), Ok(()));
+    assert_eq!(local.pending_yield(), Some(thread));
+    assert_eq!(
+      local.install_pending_yield(other),
+      Err(Error::PendingYieldBusy)
+    );
+    assert_eq!(
+      local.clear_pending_yield(other),
+      Err(Error::PendingYieldMismatch)
+    );
+    assert_eq!(local.clear_pending_yield(thread), Ok(()));
+    assert_eq!(local.pending_yield(), None);
   }
 }

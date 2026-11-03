@@ -16,6 +16,7 @@ pub enum ThreadState {
   New,
   Runnable,
   Running,
+  Switching,
   Blocked,
   Stopped,
 }
@@ -117,6 +118,24 @@ impl Thread {
     Ok(())
   }
 
+  pub(crate) fn begin_switch_out(&mut self) -> Result<(), Error> {
+    if self.state != ThreadState::Running {
+      return Err(Error::InvalidState);
+    }
+    self.state = ThreadState::Switching;
+    self.running_hart = None;
+    Ok(())
+  }
+
+  pub(crate) fn finish_yield(&mut self) -> Result<(), Error> {
+    if self.state != ThreadState::Switching {
+      return Err(Error::InvalidState);
+    }
+    self.state = ThreadState::Runnable;
+    self.running_hart = None;
+    Ok(())
+  }
+
   pub fn block(&mut self) -> Result<(), Error> {
     if self.state != ThreadState::Running {
       return Err(Error::InvalidState);
@@ -127,7 +146,7 @@ impl Thread {
   }
 
   pub fn stop(&mut self) -> Result<(), Error> {
-    if self.state == ThreadState::Stopped {
+    if matches!(self.state, ThreadState::Stopped | ThreadState::Switching) {
       return Err(Error::InvalidState);
     }
     self.state = ThreadState::Stopped;
@@ -377,5 +396,29 @@ mod tests {
       .expect_err("second execution install must fail");
     assert_eq!(failure.error(), Error::ExecutionAlreadyInstalled);
     assert_eq!(failure.into_parts().1.base(), 0x9001_0000);
+  }
+
+  #[test]
+  fn thread_011_switching_requires_running_and_finishes_runnable() {
+    let mut thread = thread();
+    assert_eq!(thread.begin_switch_out(), Err(Error::InvalidState));
+    thread.make_runnable().unwrap();
+    thread.begin_running(0).unwrap();
+    thread.begin_switch_out().unwrap();
+    assert_eq!(thread.state(), ThreadState::Switching);
+    assert_eq!(thread.running_hart(), None);
+    thread.finish_yield().unwrap();
+    assert_eq!(thread.state(), ThreadState::Runnable);
+  }
+
+  #[test]
+  fn thread_012_switching_cannot_use_general_wake_transition() {
+    let mut thread = thread();
+    thread.make_runnable().unwrap();
+    thread.begin_running(0).unwrap();
+    thread.begin_switch_out().unwrap();
+    assert_eq!(thread.make_runnable(), Err(Error::InvalidState));
+    assert_eq!(thread.stop(), Err(Error::InvalidState));
+    assert_eq!(thread.state(), ThreadState::Switching);
   }
 }

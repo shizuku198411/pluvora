@@ -705,6 +705,95 @@ impl KernelState {
     )
   }
 
+  #[cfg(target_arch = "riscv64")]
+  fn prepare_current_thread_yield(
+    &mut self,
+    hart: usize,
+    thread_id: ObjectId,
+  ) -> Result<*mut crate::arch::riscv64::context::SavedContext, Error> {
+    let local = crate::arch::riscv64::hart::local_by_index(hart).ok_or(Error::Hart(
+      crate::arch::riscv64::hart::Error::InvalidHartIndex,
+    ))?;
+    if local.current_thread() != Some(thread_id) {
+      return Err(Error::Hart(
+        crate::arch::riscv64::hart::Error::CurrentThreadMismatch,
+      ));
+    }
+    if local.pending_yield().is_some() {
+      return Err(Error::Hart(
+        crate::arch::riscv64::hart::Error::PendingYieldBusy,
+      ));
+    }
+    let snapshot = self.thread_snapshot(thread_id)?;
+    if snapshot.state != ThreadState::Running || snapshot.running_hart != u16::try_from(hart).ok() {
+      return Err(Error::CommitInvariant);
+    }
+    if self.scheduler()?.running_thread(hart)? != Some(thread_id) {
+      return Err(Error::CommitInvariant);
+    }
+    let outgoing = self.thread_context_pointer(thread_id)?;
+
+    local
+      .install_pending_yield(thread_id)
+      .unwrap_or_else(|_| panic!("preflighted pending yield publication failed"));
+    self
+      .scheduler_mut()
+      .unwrap_or_else(|_| panic!("initialized scheduler disappeared"))
+      .suspend_running(hart, thread_id)
+      .unwrap_or_else(|_| panic!("preflighted scheduler suspend failed"));
+    self
+      .objects
+      .get_mut(thread_id)
+      .unwrap_or_else(|_| panic!("yielding Thread disappeared"))
+      .as_thread_mut()
+      .unwrap_or_else(|| panic!("yielding Object changed type"))
+      .begin_switch_out()
+      .unwrap_or_else(|_| panic!("running Thread refused switch-out"));
+    local
+      .clear_current_thread(thread_id)
+      .unwrap_or_else(|_| panic!("current Thread changed during yield"));
+    Ok(outgoing)
+  }
+
+  #[cfg(target_arch = "riscv64")]
+  fn finalize_current_hart_yield(&mut self, hart: usize) -> Result<Option<ObjectId>, Error> {
+    let local = crate::arch::riscv64::hart::local_by_index(hart).ok_or(Error::Hart(
+      crate::arch::riscv64::hart::Error::InvalidHartIndex,
+    ))?;
+    let Some(thread_id) = local.pending_yield() else {
+      return Ok(None);
+    };
+    let snapshot = self.thread_snapshot(thread_id)?;
+    if snapshot.state != ThreadState::Switching || snapshot.running_hart.is_some() {
+      return Err(Error::CommitInvariant);
+    }
+    let hart_bit = 1u64
+      .checked_shl(hart as u32)
+      .ok_or(Error::CommitInvariant)?;
+    if snapshot.affinity & hart_bit == 0 {
+      return Err(Error::CommitInvariant);
+    }
+    self.objects.get(thread_id)?;
+
+    self
+      .scheduler_mut()
+      .unwrap_or_else(|_| panic!("initialized scheduler disappeared"))
+      .resume_suspended(hart, thread_id, snapshot.priority)
+      .unwrap_or_else(|_| panic!("saved Thread could not be republished"));
+    self
+      .objects
+      .get_mut(thread_id)
+      .unwrap_or_else(|_| panic!("switching Thread disappeared"))
+      .as_thread_mut()
+      .unwrap_or_else(|| panic!("switching Object changed type"))
+      .finish_yield()
+      .unwrap_or_else(|_| panic!("switching Thread refused yield completion"));
+    local
+      .clear_pending_yield(thread_id)
+      .unwrap_or_else(|_| panic!("pending yield identity changed during finalize"));
+    Ok(Some(thread_id))
+  }
+
   #[cfg(test)]
   fn insert_test_object(&mut self, object: KernelObject) -> Result<ObjectId, Error> {
     Ok(self.objects.insert(object)?)
@@ -862,6 +951,11 @@ pub fn dispatch_current_hart_once() -> Result<Option<ObjectId>, Error> {
   // SAFETY: publication is complete, both contexts are live, and the state lock is dropped.
   unsafe { crate::arch::riscv64::context::switch_saved_context(scheduler, incoming) };
 
+  {
+    let mut state = KERNEL_STATE.lock();
+    state.finalize_current_hart_yield(hart)?;
+  }
+
   let local = crate::arch::riscv64::hart::local_by_index(hart).ok_or(Error::Hart(
     crate::arch::riscv64::hart::Error::InvalidHartIndex,
   ))?;
@@ -891,6 +985,31 @@ pub fn park_current_thread() -> ! {
   // SAFETY: the outgoing Thread is Blocked and unpublished before the state lock is dropped.
   unsafe { crate::arch::riscv64::context::switch_saved_context(outgoing, scheduler.cast_const()) };
   panic!("parked kernel Thread resumed without wake")
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn yield_current_thread() {
+  let hart = crate::arch::riscv64::hart::current_index();
+  let local = crate::arch::riscv64::hart::local_by_index(hart)
+    .unwrap_or_else(|| panic!("current hart index is invalid"));
+  let thread_id = local
+    .current_thread()
+    .unwrap_or_else(|| panic!("yield requires a current Thread"));
+  let outgoing = {
+    let mut state = KERNEL_STATE.lock();
+    state
+      .prepare_current_thread_yield(hart, thread_id)
+      .unwrap_or_else(|_| panic!("failed to prepare current Thread yield"))
+  };
+  let scheduler = crate::arch::riscv64::context::scheduler_context(hart)
+    .unwrap_or_else(|_| panic!("scheduler context is unavailable"));
+
+  // SAFETY: the Thread is Switching, unpublished, and exclusively owns outgoing.
+  unsafe { crate::arch::riscv64::context::switch_saved_context(outgoing, scheduler.cast_const()) };
+
+  if local.current_thread() != Some(thread_id) {
+    panic!("yielded Thread resumed without current identity");
+  }
 }
 
 #[cfg(test)]
@@ -999,6 +1118,77 @@ mod tests {
     state.wake_thread(thread).unwrap();
     assert_eq!(state.dispatch_next(0), Ok(Some(thread)));
     assert!(!state.thread_context_pointer(thread).unwrap().is_null());
+  }
+
+  #[test]
+  fn yield_001_switching_thread_is_absent_from_scheduler() {
+    let mut state = KernelState::new();
+    let (_, thread_id) = scheduler_state(&mut state);
+    state.wake_thread(thread_id).unwrap();
+    state.dispatch_next(0).unwrap();
+    state.scheduler.suspend_running(0, thread_id).unwrap();
+    state
+      .objects
+      .get_mut(thread_id)
+      .unwrap()
+      .as_thread_mut()
+      .unwrap()
+      .begin_switch_out()
+      .unwrap();
+
+    assert_eq!(state.scheduler.total_running(), 0);
+    assert_eq!(state.scheduler.total_runnable(), 0);
+    assert_eq!(
+      state
+        .objects
+        .get(thread_id)
+        .unwrap()
+        .as_thread()
+        .unwrap()
+        .state(),
+      ThreadState::Switching
+    );
+  }
+
+  #[test]
+  fn yield_002_finalize_republishes_saved_thread() {
+    let mut state = KernelState::new();
+    let (_, thread_id) = scheduler_state(&mut state);
+    state.wake_thread(thread_id).unwrap();
+    state.dispatch_next(0).unwrap();
+    state.scheduler.suspend_running(0, thread_id).unwrap();
+    let thread = state
+      .objects
+      .get_mut(thread_id)
+      .unwrap()
+      .as_thread_mut()
+      .unwrap();
+    let priority = thread.effective_priority();
+    thread.begin_switch_out().unwrap();
+    state
+      .scheduler
+      .resume_suspended(0, thread_id, priority)
+      .unwrap();
+    state
+      .objects
+      .get_mut(thread_id)
+      .unwrap()
+      .as_thread_mut()
+      .unwrap()
+      .finish_yield()
+      .unwrap();
+
+    assert_eq!(state.scheduler.queue_len(0), Ok(1));
+    assert_eq!(
+      state
+        .objects
+        .get(thread_id)
+        .unwrap()
+        .as_thread()
+        .unwrap()
+        .state(),
+      ThreadState::Runnable
+    );
   }
 
   #[test]

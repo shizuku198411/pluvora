@@ -99,6 +99,8 @@ pub fn kernel_thread(
   usize_field("Thread identity", thread.into_raw());
   u64_field("Affinity", affinity);
   console::write_line("  Entry executed    : yes");
+  console::write_line("  Yield completed   : yes");
+  console::write_line("  Resume completed  : yes");
   console::write_line("  Final state       : blocked");
   console::write_line("  Boot context      : restored");
 }

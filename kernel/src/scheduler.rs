@@ -250,6 +250,29 @@ impl SchedulerState {
       .ok_or(Error::NoRunningThread)
   }
 
+  pub(crate) fn suspend_running(&mut self, hart: usize, expected: ObjectId) -> Result<(), Error> {
+    self.require_online(hart)?;
+    let running = self.running[hart].ok_or(Error::NoRunningThread)?;
+    if running.thread != expected {
+      return Err(Error::CandidateChanged);
+    }
+    self.running[hart] = None;
+    Ok(())
+  }
+
+  pub(crate) fn resume_suspended(
+    &mut self,
+    hart: usize,
+    thread: ObjectId,
+    priority: u8,
+  ) -> Result<(), Error> {
+    self.require_online(hart)?;
+    if self.contains(thread) {
+      return Err(Error::DuplicateThread);
+    }
+    self.queues[hart].push(Entry { thread, priority })
+  }
+
   pub fn remove_queued(&mut self, thread: ObjectId) -> Result<(), Error> {
     for queue in &mut self.queues {
       if queue.contains(thread) {
@@ -421,5 +444,29 @@ mod tests {
     assert!(!lower.request_reschedule);
     let higher = scheduler.enqueue(thread(3), 1, 5).unwrap();
     assert!(higher.request_reschedule);
+  }
+
+  #[test]
+  fn sched_013_suspended_thread_is_in_no_execution_location() {
+    let mut scheduler = scheduler();
+    let thread = thread(1);
+    scheduler.enqueue(thread, 1, 8).unwrap();
+    scheduler.dispatch_expected(0, thread).unwrap();
+    scheduler.suspend_running(0, thread).unwrap();
+    assert_eq!(scheduler.total_running(), 0);
+    assert_eq!(scheduler.total_runnable(), 0);
+    assert_eq!(scheduler.running_thread(0), Ok(None));
+  }
+
+  #[test]
+  fn sched_014_suspended_thread_resumes_on_same_hart() {
+    let mut scheduler = scheduler();
+    let thread = thread(1);
+    scheduler.enqueue(thread, 1, 8).unwrap();
+    scheduler.dispatch_expected(0, thread).unwrap();
+    scheduler.suspend_running(0, thread).unwrap();
+    scheduler.resume_suspended(0, thread, 8).unwrap();
+    assert_eq!(scheduler.queue_len(0), Ok(1));
+    assert_eq!(scheduler.peek_next(0), Ok(Some(thread)));
   }
 }
