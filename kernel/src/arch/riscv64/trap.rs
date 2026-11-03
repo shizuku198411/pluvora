@@ -3,7 +3,7 @@ use core::arch::asm;
 
 #[cfg(target_arch = "riscv64")]
 use crate::{
-  arch::riscv64::ipi,
+  arch::riscv64::{ipi, timer},
   support::{console, cpu},
 };
 
@@ -168,6 +168,11 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
     return;
   }
 
+  if cause == Cause::Interrupt(Interrupt::SupervisorTimer) {
+    timer::handle_local();
+    return;
+  }
+
   if cause == Cause::Exception(Exception::Breakpoint) {
     frame.sepc = frame
       .sepc
@@ -256,6 +261,14 @@ mod tests {
     assert_eq!(
       Cause::from_scause(INTERRUPT_BIT | 9),
       Cause::Interrupt(Interrupt::SupervisorExternal)
+    );
+  }
+
+  #[test]
+  fn trap_007_supervisor_timer_interrupt_is_decoded() {
+    assert_eq!(
+      Cause::from_scause(INTERRUPT_BIT | INTERRUPT_SUPERVISOR_TIMER),
+      Cause::Interrupt(Interrupt::SupervisorTimer)
     );
   }
 

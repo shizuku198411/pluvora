@@ -14,6 +14,11 @@ const EXTENSION_IPI: usize = 0x0073_5049;
 #[cfg(target_arch = "riscv64")]
 const IPI_SEND_IPI: usize = 0;
 
+#[cfg(target_arch = "riscv64")]
+const EXTENSION_TIME: usize = 0x5449_4d45;
+#[cfg(target_arch = "riscv64")]
+const TIME_SET_TIMER: usize = 0;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Error {
   code: isize,
@@ -56,6 +61,17 @@ pub fn hart_start(hart_id: usize, start_address: usize, opaque: usize) -> Result
 pub fn send_ipi(raw_hart_id: usize) -> Result<(), Error> {
   let (hart_mask, hart_mask_base) = single_hart_mask(raw_hart_id);
   let (error, _value) = unsafe { call(EXTENSION_IPI, IPI_SEND_IPI, hart_mask, hart_mask_base, 0) };
+  if error == SBI_SUCCESS {
+    Ok(())
+  } else {
+    Err(Error { code: error })
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn set_timer(deadline: u64) -> Result<(), Error> {
+  let deadline = usize::try_from(deadline).map_err(|_| Error { code: -3 })?;
+  let (error, _value) = unsafe { call(EXTENSION_TIME, TIME_SET_TIMER, deadline, 0, 0) };
   if error == SBI_SUCCESS {
     Ok(())
   } else {

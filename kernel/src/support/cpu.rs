@@ -10,6 +10,7 @@ pub fn halt() -> ! {
 }
 
 pub fn idle() -> ! {
+  hart::enable_interrupts_for_idle();
   loop {
     if hart::current().has_ipi_requests() {
       ipi::handle_local();

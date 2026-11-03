@@ -24,6 +24,8 @@ pub enum Error {
   InvalidMemoryRegion,
   OverlappingMemoryRegions,
   TooManyReservedRegions,
+  MissingTimebaseFrequency,
+  DuplicateTimebaseFrequency,
 }
 
 impl Error {
@@ -40,6 +42,8 @@ impl Error {
       Self::InvalidMemoryRegion => "invalid physical memory region",
       Self::OverlappingMemoryRegions => "physical memory regions overlap",
       Self::TooManyReservedRegions => "too many reserved memory regions",
+      Self::MissingTimebaseFrequency => "timebase frequency is missing or zero",
+      Self::DuplicateTimebaseFrequency => "timebase frequency is duplicated",
     }
   }
 }
@@ -71,6 +75,7 @@ pub struct PlatformInfo {
   memory_region_count: usize,
   reserved_regions: [MemoryRegion; MAX_RESERVED_REGIONS],
   reserved_region_count: usize,
+  timebase_frequency: u64,
 }
 
 impl PlatformInfo {
@@ -82,6 +87,7 @@ impl PlatformInfo {
       memory_region_count: 0,
       reserved_regions: [MemoryRegion::EMPTY; MAX_RESERVED_REGIONS],
       reserved_region_count: 0,
+      timebase_frequency: 0,
     }
   }
 
@@ -104,12 +110,17 @@ impl PlatformInfo {
     &self.reserved_regions[..self.reserved_region_count]
   }
 
+  pub const fn timebase_frequency(&self) -> u64 {
+    self.timebase_frequency
+  }
+
   #[cfg(test)]
   pub(crate) fn for_test(memory: &[MemoryRegion], reserved: &[MemoryRegion]) -> Self {
     assert!(memory.len() <= MAX_MEMORY_REGIONS);
     assert!(reserved.len() <= MAX_RESERVED_REGIONS);
 
     let mut info = Self::new();
+    info.timebase_frequency = 1;
     for region in memory {
       info.memory_regions[info.memory_region_count] = *region;
       info.memory_region_count += 1;
@@ -180,6 +191,7 @@ struct NodeState<'a> {
   device_type: Option<&'a str>,
   status: Option<&'a str>,
   reg: Option<&'a [u8]>,
+  timebase_frequency: Option<u32>,
 }
 
 impl<'a> NodeState<'a> {
@@ -192,6 +204,7 @@ impl<'a> NodeState<'a> {
     device_type: None,
     status: None,
     reg: None,
+    timebase_frequency: None,
   };
 
   const fn new(name: &'a str, parent_address_cells: u32, parent_size_cells: u32) -> Self {
@@ -204,6 +217,7 @@ impl<'a> NodeState<'a> {
       device_type: None,
       status: None,
       reg: None,
+      timebase_frequency: None,
     }
   }
 
@@ -250,6 +264,7 @@ pub fn discover(dtb: &Dtb<'_>, boot_hart: usize) -> Result<PlatformInfo, Error> 
           "device_type" => node.device_type = Some(read_string(value)?),
           "status" => node.status = Some(read_string(value)?),
           "reg" => node.reg = Some(value),
+          "timebase-frequency" => node.timebase_frequency = Some(read_single_cell(value)?),
           _ => {}
         }
       }
@@ -293,6 +308,9 @@ pub fn discover(dtb: &Dtb<'_>, boot_hart: usize) -> Result<PlatformInfo, Error> 
   if info.memory_regions().is_empty() {
     return Err(Error::InvalidMemoryRegion);
   }
+  if info.timebase_frequency == 0 {
+    return Err(Error::MissingTimebaseFrequency);
+  }
 
   Ok(info)
 }
@@ -303,6 +321,19 @@ fn finish_node(
   parent_name: Option<&str>,
   node: NodeState<'_>,
 ) -> Result<(), Error> {
+  if depth == 1 && node.name == "cpus" {
+    let frequency = node
+      .timebase_frequency
+      .ok_or(Error::MissingTimebaseFrequency)?;
+    if frequency == 0 {
+      return Err(Error::MissingTimebaseFrequency);
+    }
+    if info.timebase_frequency != 0 {
+      return Err(Error::DuplicateTimebaseFrequency);
+    }
+    info.timebase_frequency = u64::from(frequency);
+  }
+
   let is_cpu = depth == 2 && parent_name == Some("cpus") && node.device_type == Some("cpu");
   if is_cpu && node.enabled() {
     let reg = node.reg.ok_or(Error::InvalidProperty)?;
@@ -506,6 +537,50 @@ mod tests {
           size: 0x1000,
         })
         .is_ok()
+    );
+  }
+
+  #[test]
+  fn plat_015_cpus_node_publishes_timebase_frequency() {
+    let mut info = PlatformInfo::new();
+    let node = NodeState {
+      name: "cpus",
+      timebase_frequency: Some(10_000_000),
+      ..NodeState::EMPTY
+    };
+
+    finish_node(&mut info, 1, Some(""), node).unwrap();
+    assert_eq!(info.timebase_frequency(), 10_000_000);
+  }
+
+  #[test]
+  fn plat_016_zero_timebase_frequency_is_rejected() {
+    let mut info = PlatformInfo::new();
+    let node = NodeState {
+      name: "cpus",
+      timebase_frequency: Some(0),
+      ..NodeState::EMPTY
+    };
+
+    assert_eq!(
+      finish_node(&mut info, 1, Some(""), node),
+      Err(Error::MissingTimebaseFrequency)
+    );
+  }
+
+  #[test]
+  fn plat_017_duplicate_cpus_timebase_is_rejected() {
+    let mut info = PlatformInfo::new();
+    let node = NodeState {
+      name: "cpus",
+      timebase_frequency: Some(10_000_000),
+      ..NodeState::EMPTY
+    };
+
+    finish_node(&mut info, 1, Some(""), node).unwrap();
+    assert_eq!(
+      finish_node(&mut info, 1, Some(""), node),
+      Err(Error::DuplicateTimebaseFrequency)
     );
   }
 

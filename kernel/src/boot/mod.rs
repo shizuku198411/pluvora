@@ -5,7 +5,7 @@ use core::ptr::addr_of;
 use crate::arch::riscv64::{
   context, hart, ipi,
   paging::{self, KernelLayout},
-  trap,
+  timer, trap,
 };
 use crate::dtb::Dtb;
 use crate::kernel_state;
@@ -67,6 +67,10 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
 
   let boot_index = hart::initialize_boot_hart(&platform, hart_id)
     .unwrap_or_else(|error| fail("Harts", error.as_str()));
+  timer::initialize_frequency(platform.timebase_frequency())
+    .unwrap_or_else(|error| fail("Timer", error.as_str()));
+  let timer_deadline =
+    timer::initialize_local().unwrap_or_else(|error| fail("Timer", error.as_str()));
   let free_before = frame_allocator::initialize(&allocator)
     .unwrap_or_else(|error| fail("Runtime Memory", error.as_str()));
   let stack = kernel_stack::KernelStack::allocate()
@@ -96,6 +100,15 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
   let requested = hart::start_secondaries(&platform, hart_id, paging)
     .unwrap_or_else(|error| fail("Harts", error.as_str()));
   report::hart_bootstrap(boot_index, requested, hart::online_count(&platform));
+  let timer_tick =
+    timer::run_boot_smoke_test().unwrap_or_else(|error| fail("Timer", error.as_str()));
+  if !hart::current().take_reschedule_request() {
+    fail(
+      "Timer",
+      "timer interrupt did not publish reschedule request",
+    );
+  }
+  report::timer(platform.timebase_frequency(), timer_deadline, timer_tick);
 
   let (online_mask, runnable, running) =
     kernel_state::initialize_scheduler_state(hart::online_mask())
@@ -161,6 +174,7 @@ pub fn run_secondary(hart_id: usize, hart_index: usize) -> ! {
   let _stvec = trap::install();
   ipi::enable_local();
   hart::install_kernel_address_space();
+  timer::initialize_local().unwrap_or_else(|_| cpu::halt());
   hart::complete_secondary(hart_id, hart_index).unwrap_or_else(|_| cpu::halt());
   cpu::idle()
 }

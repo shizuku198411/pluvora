@@ -143,6 +143,11 @@ impl HartLocal {
     Ok(previous == 1 && self.restore_interrupts.swap(false, Ordering::Relaxed))
   }
 
+  #[cfg(target_arch = "riscv64")]
+  fn interrupts_are_unmasked(&self) -> bool {
+    self.interrupt_disable_depth.load(Ordering::Relaxed) == 0
+  }
+
   fn enter_preemption_disabled(&self) -> Result<(), DepthError> {
     increment_depth(&self.preemption_disable_depth).map(|_| ())
   }
@@ -300,6 +305,38 @@ fn disable_local_interrupts() -> bool {
 fn enable_local_interrupts() {
   const SSTATUS_SIE: usize = 1 << 1;
   unsafe { asm!("csrs sstatus, {mask}", mask = in(reg) SSTATUS_SIE, options(nomem, nostack)) };
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn run_with_local_interrupts_enabled(action: impl FnOnce()) {
+  let local = current();
+  assert!(
+    local.interrupts_are_unmasked(),
+    "cannot enable interrupts inside InterruptGuard"
+  );
+  let was_enabled = local_interrupts_enabled();
+  enable_local_interrupts();
+  action();
+  if !was_enabled {
+    disable_local_interrupts();
+  }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn enable_interrupts_for_idle() {
+  assert!(
+    current().interrupts_are_unmasked(),
+    "cannot enter interrupt-enabled idle inside InterruptGuard"
+  );
+  enable_local_interrupts();
+}
+
+#[cfg(target_arch = "riscv64")]
+fn local_interrupts_enabled() -> bool {
+  const SSTATUS_SIE: usize = 1 << 1;
+  let value: usize;
+  unsafe { asm!("csrr {value}, sstatus", value = out(reg) value, options(nomem, nostack)) };
+  value & SSTATUS_SIE != 0
 }
 
 #[repr(C)]

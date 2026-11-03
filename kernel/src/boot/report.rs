@@ -89,6 +89,15 @@ pub fn context_switch() {
   );
 }
 
+pub fn timer(frequency: u64, deadline: u64, tick: u64) {
+  section("Supervisor Timer");
+  u64_field("Timebase frequency", frequency);
+  u64_field("Tick rate", crate::arch::riscv64::timer::TIMER_HZ);
+  u64_field("Initial deadline", deadline);
+  u64_field("Observed ticks", tick);
+  console::write_line("  Reschedule request: published");
+}
+
 pub fn kernel_thread(
   thread: crate::object::ObjectId,
   process: crate::object::ObjectId,
