@@ -80,6 +80,14 @@ pub fn scheduler(online_mask: u64, runnable: usize, running: usize) {
   usize_field("Running threads", running);
 }
 
+pub fn scheduler_runtime() {
+  section("Scheduler Runtime");
+  console::write_line("  Ready publication : complete");
+  console::write_line("  Hart loops        : enabled");
+  console::write_line("  Idle policy       : interrupt-driven WFI");
+  console::write_line("  Wake notification : reschedule IPI");
+}
+
 pub fn context_switch() {
   section("Context Switch");
   console::write_line("  Callee-saved ABI  : verified");

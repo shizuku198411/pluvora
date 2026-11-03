@@ -128,6 +128,10 @@ impl HartLocal {
     self.reschedule_pending.swap(false, Ordering::AcqRel)
   }
 
+  pub fn reschedule_requested(&self) -> bool {
+    self.reschedule_pending.load(Ordering::Acquire)
+  }
+
   pub(crate) fn can_preempt(&self) -> bool {
     self.interrupt_disable_depth.load(Ordering::Relaxed) == 0
       && self.preemption_disable_depth.load(Ordering::Relaxed) == 0
@@ -358,15 +362,6 @@ pub(crate) fn run_with_local_interrupts_enabled(action: impl FnOnce()) {
   if !was_enabled {
     disable_local_interrupts();
   }
-}
-
-#[cfg(target_arch = "riscv64")]
-pub(crate) fn enable_interrupts_for_idle() {
-  assert!(
-    current().interrupts_are_unmasked(),
-    "cannot enter interrupt-enabled idle inside InterruptGuard"
-  );
-  enable_local_interrupts();
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -778,6 +773,17 @@ mod tests {
     local.request_reschedule();
     assert!(local.take_reschedule_request());
     assert!(!local.take_reschedule_request());
+  }
+
+  #[test]
+  fn ipi_008_reschedule_observation_does_not_consume_request() {
+    let local = HartLocal::empty();
+    assert!(!local.reschedule_requested());
+    local.request_reschedule();
+    assert!(local.reschedule_requested());
+    assert!(local.reschedule_requested());
+    assert!(local.take_reschedule_request());
+    assert!(!local.reschedule_requested());
   }
 
   #[test]

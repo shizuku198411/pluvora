@@ -167,8 +167,9 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
   }
   report::kernel_thread(thread.object, process.object, affinity);
 
+  report::scheduler_runtime();
   report::complete();
-  cpu::idle()
+  kernel_state::run_scheduler_loop()
 }
 
 pub fn run_secondary(hart_id: usize, hart_index: usize) -> ! {
@@ -180,7 +181,7 @@ pub fn run_secondary(hart_id: usize, hart_index: usize) -> ! {
   hart::install_kernel_address_space();
   timer::initialize_local().unwrap_or_else(|_| cpu::halt());
   hart::complete_secondary(hart_id, hart_index).unwrap_or_else(|_| cpu::halt());
-  cpu::idle()
+  kernel_state::run_scheduler_loop()
 }
 
 fn load_dtb(dtb_address: usize) -> Dtb<'static> {

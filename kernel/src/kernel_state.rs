@@ -9,9 +9,13 @@ use crate::thread::{self, Thread, ThreadState};
 
 #[cfg(target_arch = "riscv64")]
 use crate::sync::SpinLock;
+#[cfg(target_arch = "riscv64")]
+use core::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(target_arch = "riscv64")]
 static KERNEL_STATE: SpinLock<KernelState> = SpinLock::new(KernelState::new());
+#[cfg(target_arch = "riscv64")]
+static SCHEDULER_READY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -927,9 +931,39 @@ pub fn counts() -> (usize, usize, usize) {
 
 #[cfg(target_arch = "riscv64")]
 pub fn initialize_scheduler_state(online_mask: u64) -> Result<(u64, usize, usize), Error> {
-  let mut state = KERNEL_STATE.lock();
-  state.initialize_scheduler(online_mask)?;
-  state.scheduler_summary()
+  let summary = {
+    let mut state = KERNEL_STATE.lock();
+    state.initialize_scheduler(online_mask)?;
+    state
+      .scheduler_summary()
+      .unwrap_or_else(|_| panic!("initialized scheduler has no summary"))
+  };
+  publish_scheduler_ready();
+
+  let current = crate::arch::riscv64::hart::current_index();
+  for target in 0..crate::platform::MAX_HARTS {
+    let Some(bit) = 1u64.checked_shl(target as u32) else {
+      continue;
+    };
+    if online_mask & bit == 0 || target == current {
+      continue;
+    }
+    crate::arch::riscv64::ipi::send(target, crate::arch::riscv64::ipi::Request::Reschedule)
+      .unwrap_or_else(|_| panic!("failed to wake scheduler hart"));
+  }
+  Ok(summary)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn scheduler_ready() -> bool {
+  SCHEDULER_READY.load(Ordering::Acquire)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn publish_scheduler_ready() {
+  if SCHEDULER_READY.swap(true, Ordering::Release) {
+    panic!("scheduler readiness was published twice");
+  }
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -976,7 +1010,23 @@ pub fn bootstrap_space() -> CapabilitySpaceId {
 
 #[cfg(target_arch = "riscv64")]
 pub fn wake_thread(thread_id: ObjectId) -> Result<WakeResult, Error> {
-  KERNEL_STATE.lock().wake_thread(thread_id)
+  let result = {
+    let mut state = KERNEL_STATE.lock();
+    state.wake_thread(thread_id)?
+  };
+  if result.request_reschedule {
+    let current = crate::arch::riscv64::hart::current_index();
+    if result.target_hart == current {
+      crate::arch::riscv64::hart::current().request_reschedule();
+    } else {
+      crate::arch::riscv64::ipi::send(
+        result.target_hart,
+        crate::arch::riscv64::ipi::Request::Reschedule,
+      )
+      .unwrap_or_else(|_| panic!("failed to notify woken Thread target"));
+    }
+  }
+  Ok(result)
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -989,6 +1039,9 @@ pub(crate) fn try_preempt_current_thread(trap_frame: *mut crate::arch::riscv64::
   let hart = crate::arch::riscv64::hart::current_index();
   let local = crate::arch::riscv64::hart::current();
   if trap_frame.is_null() {
+    return;
+  }
+  if !local.reschedule_requested() {
     return;
   }
   let Some(thread_id) = local.current_thread() else {
@@ -1044,6 +1097,22 @@ pub fn dispatch_current_hart_once() -> Result<Option<ObjectId>, Error> {
     return Err(Error::CommitInvariant);
   }
   Ok(Some(thread_id))
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn run_scheduler_loop() -> ! {
+  while !scheduler_ready() {
+    crate::support::cpu::wait_for_interrupt();
+  }
+
+  loop {
+    crate::arch::riscv64::hart::current().take_reschedule_request();
+    match dispatch_current_hart_once() {
+      Ok(Some(_)) => {}
+      Ok(None) => crate::support::cpu::wait_for_interrupt(),
+      Err(_) => panic!("per-hart scheduler loop failed"),
+    }
+  }
 }
 
 #[cfg(target_arch = "riscv64")]

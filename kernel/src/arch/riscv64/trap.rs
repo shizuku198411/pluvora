@@ -166,6 +166,9 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
 
   if cause == Cause::Interrupt(Interrupt::SupervisorSoftware) {
     ipi::handle_local();
+    if crate::arch::riscv64::hart::current().reschedule_requested() {
+      kernel_state::try_preempt_current_thread(frame);
+    }
     return;
   }
 
