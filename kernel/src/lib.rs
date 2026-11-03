@@ -8,6 +8,7 @@ pub mod capability;
 pub mod capability_space;
 pub mod dtb;
 pub mod kernel_state;
+pub mod kernel_thread;
 pub mod memory;
 pub mod object;
 pub mod platform;

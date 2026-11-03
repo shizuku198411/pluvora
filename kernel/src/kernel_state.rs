@@ -3,7 +3,7 @@ use crate::capability_space::{self, CapabilitySpaceId, CapabilitySpaceTable};
 #[cfg(target_arch = "riscv64")]
 use crate::memory::address_space::{AddressSpace, Asid};
 use crate::object::{self, KernelObject, ObjectId, ObjectTable, ObjectType};
-use crate::process::{ProcessState, ResourceCharge};
+use crate::process::{Process, ProcessLimits, ProcessState, ResourceCharge};
 use crate::scheduler::{self, SchedulerState, WakeResult};
 use crate::thread::{self, Thread, ThreadState};
 
@@ -28,6 +28,8 @@ pub enum Error {
   ProcessNotAlive,
   Process(crate::process::Error),
   KernelStack(crate::memory::kernel_stack::Error),
+  Hart(crate::arch::riscv64::hart::Error),
+  KernelAddressSpaceUninitialized,
   RollbackFailed,
 }
 
@@ -47,6 +49,8 @@ impl Error {
       Self::ProcessNotAlive => "owner process is not alive",
       Self::Process(_) => "process resource accounting failed",
       Self::KernelStack(_) => "kernel stack operation failed",
+      Self::Hart(_) => "hart-local thread operation failed",
+      Self::KernelAddressSpaceUninitialized => "kernel Address Space is not initialized",
       Self::RollbackFailed => "kernel state transaction rollback failed",
     }
   }
@@ -82,7 +86,15 @@ impl From<thread::Error> for Error {
   }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootstrapProcess {
+  pub object: ObjectId,
+  pub authority: CapabilityHandle,
+  pub space: CapabilitySpaceId,
+}
+
 pub struct KernelState {
+  bootstrap_process: Option<BootstrapProcess>,
   objects: ObjectTable,
   spaces: CapabilitySpaceTable,
   next_capability_node: u64,
@@ -103,6 +115,7 @@ struct ThreadSnapshot {
 impl KernelState {
   pub const fn new() -> Self {
     Self {
+      bootstrap_process: None,
       objects: ObjectTable::new(),
       spaces: CapabilitySpaceTable::new(),
       next_capability_node: 1,
@@ -598,6 +611,100 @@ impl KernelState {
     })
   }
 
+  fn thread_context_pointer(
+    &mut self,
+    thread_id: ObjectId,
+  ) -> Result<*mut crate::arch::riscv64::context::SavedContext, Error> {
+    let thread = self
+      .objects
+      .get_mut(thread_id)?
+      .as_thread_mut()
+      .ok_or(Error::Object(object::Error::WrongObjectType))?;
+    let execution = thread
+      .execution_mut()
+      .ok_or(Error::Thread(thread::Error::ExecutionMissing))?;
+    Ok(execution.context_mut() as *mut _)
+  }
+
+  fn create_bootstrap_process(&mut self) -> Result<BootstrapProcess, Error> {
+    if self.bootstrap_process.is_some() {
+      return Err(Error::AlreadyInitialized);
+    }
+    let address_space_handle = self
+      .kernel_address_space
+      .ok_or(Error::KernelAddressSpaceUninitialized)?;
+    let address_space = self.spaces.get(self.bootstrap_space())?.lookup(
+      address_space_handle,
+      ObjectType::AddressSpace,
+      Rights::MAP,
+    )?;
+    let process_space = self.create_capability_space()?;
+    let limits = ProcessLimits::new(4, 16, 16, 16).map_err(Error::Process)?;
+    let mut process = Process::new(address_space, process_space, limits);
+    process.start().map_err(Error::Process)?;
+    let authority = self
+      .create_object_with_capability(KernelObject::Process(process), BOOTSTRAP_PROCESS_RIGHTS)?;
+    let object = self.spaces.get(self.bootstrap_space())?.lookup(
+      authority,
+      ObjectType::Process,
+      Rights::CREATE,
+    )?;
+    let created = BootstrapProcess {
+      object,
+      authority,
+      space: process_space,
+    };
+    self.bootstrap_process = Some(created);
+    Ok(created)
+  }
+
+  #[cfg(target_arch = "riscv64")]
+  fn prepare_current_hart_dispatch(
+    &mut self,
+    hart: usize,
+  ) -> Result<Option<(ObjectId, *const crate::arch::riscv64::context::SavedContext)>, Error> {
+    let local = crate::arch::riscv64::hart::local_by_index(hart).ok_or(Error::Hart(
+      crate::arch::riscv64::hart::Error::InvalidHartIndex,
+    ))?;
+    if local.current_thread().is_some() {
+      return Err(Error::Hart(
+        crate::arch::riscv64::hart::Error::CurrentThreadBusy,
+      ));
+    }
+    let Some(thread_id) = self.dispatch_next(hart)? else {
+      return Ok(None);
+    };
+    local
+      .install_current_thread(thread_id)
+      .unwrap_or_else(|_| panic!("preflighted current Thread publication failed"));
+    let context = self
+      .thread_context_pointer(thread_id)
+      .unwrap_or_else(|_| panic!("dispatched Thread lost its execution context"));
+    Ok(Some((thread_id, context.cast_const())))
+  }
+
+  #[cfg(target_arch = "riscv64")]
+  fn prepare_current_thread_park(
+    &mut self,
+    hart: usize,
+    thread_id: ObjectId,
+  ) -> Result<*mut crate::arch::riscv64::context::SavedContext, Error> {
+    if self.block_current(hart)? != thread_id {
+      return Err(Error::CommitInvariant);
+    }
+    let local = crate::arch::riscv64::hart::local_by_index(hart).ok_or(Error::Hart(
+      crate::arch::riscv64::hart::Error::InvalidHartIndex,
+    ))?;
+    local
+      .clear_current_thread(thread_id)
+      .unwrap_or_else(|_| panic!("running Thread identity changed during park"));
+    Ok(
+      self
+        .thread_context_pointer(thread_id)
+        .unwrap_or_else(|_| panic!("parked Thread lost its execution context")),
+    )
+  }
+
   #[cfg(test)]
   fn insert_test_object(&mut self, object: KernelObject) -> Result<ObjectId, Error> {
     Ok(self.objects.insert(object)?)
@@ -615,6 +722,14 @@ const THREAD_OWNER_RIGHTS: Rights = Rights::READ
   .union(Rights::TRANSFER)
   .union(Rights::GRANT)
   .union(Rights::REVOKE)
+  .union(Rights::DESTROY);
+
+const BOOTSTRAP_PROCESS_RIGHTS: Rights = Rights::READ
+  .union(Rights::WRITE)
+  .union(Rights::TRANSFER)
+  .union(Rights::GRANT)
+  .union(Rights::REVOKE)
+  .union(Rights::CREATE)
   .union(Rights::DESTROY);
 
 const THREAD_CHARGE: ResourceCharge = ResourceCharge {
@@ -709,8 +824,78 @@ pub fn create_thread(
   }
 }
 
+#[cfg(target_arch = "riscv64")]
+pub fn initialize_bootstrap_process() -> Result<BootstrapProcess, Error> {
+  KERNEL_STATE.lock().create_bootstrap_process()
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn bootstrap_space() -> CapabilitySpaceId {
+  KERNEL_STATE.lock().bootstrap_space()
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn wake_thread(thread_id: ObjectId) -> Result<WakeResult, Error> {
+  KERNEL_STATE.lock().wake_thread(thread_id)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn global_scheduler_summary() -> Result<(u64, usize, usize), Error> {
+  KERNEL_STATE.lock().scheduler_summary()
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn dispatch_current_hart_once() -> Result<Option<ObjectId>, Error> {
+  let _interrupt = crate::arch::riscv64::hart::InterruptGuard::disable();
+  let _preemption = crate::arch::riscv64::hart::PreemptionGuard::disable();
+  let hart = crate::arch::riscv64::hart::current_index();
+  let scheduler =
+    crate::arch::riscv64::context::scheduler_context(hart).map_err(thread::Error::Context)?;
+  let prepared = {
+    let mut state = KERNEL_STATE.lock();
+    state.prepare_current_hart_dispatch(hart)?
+  };
+  let Some((thread_id, incoming)) = prepared else {
+    return Ok(None);
+  };
+
+  // SAFETY: publication is complete, both contexts are live, and the state lock is dropped.
+  unsafe { crate::arch::riscv64::context::switch_saved_context(scheduler, incoming) };
+
+  let local = crate::arch::riscv64::hart::local_by_index(hart).ok_or(Error::Hart(
+    crate::arch::riscv64::hart::Error::InvalidHartIndex,
+  ))?;
+  if local.current_thread().is_some() {
+    return Err(Error::CommitInvariant);
+  }
+  Ok(Some(thread_id))
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn park_current_thread() -> ! {
+  let hart = crate::arch::riscv64::hart::current_index();
+  let local = crate::arch::riscv64::hart::local_by_index(hart)
+    .unwrap_or_else(|| panic!("current hart index is invalid"));
+  let thread_id = local
+    .current_thread()
+    .unwrap_or_else(|| panic!("kernel Thread has no current identity"));
+  let outgoing = {
+    let mut state = KERNEL_STATE.lock();
+    state
+      .prepare_current_thread_park(hart, thread_id)
+      .unwrap_or_else(|_| panic!("failed to park current kernel Thread"))
+  };
+  let scheduler = crate::arch::riscv64::context::scheduler_context(hart)
+    .unwrap_or_else(|_| panic!("scheduler context is unavailable"));
+
+  // SAFETY: the outgoing Thread is Blocked and unpublished before the state lock is dropped.
+  unsafe { crate::arch::riscv64::context::switch_saved_context(outgoing, scheduler.cast_const()) };
+  panic!("parked kernel Thread resumed without wake")
+}
+
 #[cfg(test)]
 mod tests {
+  use crate::memory::address_space::{AddressSpace, Asid};
   use crate::object::MemoryObject;
   use crate::process::{Process, ProcessLimits};
   use crate::thread::{Thread, ThreadState};
@@ -760,6 +945,60 @@ mod tests {
       .insert_test_object(KernelObject::Thread(thread))
       .unwrap();
     (process, thread)
+  }
+
+  #[test]
+  fn dispatch_000_bootstrap_process_uses_kernel_address_space() {
+    let mut state = KernelState::new();
+    let address_space = AddressSpace::new(0x8020_0000, Asid::kernel()).unwrap();
+    let handle = state
+      .create_object_with_capability(
+        KernelObject::AddressSpace(address_space),
+        Rights::MAP.union(Rights::SHARE),
+      )
+      .unwrap();
+    state.kernel_address_space = Some(handle);
+
+    let process = state.create_bootstrap_process().unwrap();
+    assert!(matches!(
+      state.objects.get(process.object),
+      Ok(KernelObject::Process(process)) if process.state() == ProcessState::Alive
+    ));
+    assert_eq!(
+      state.create_bootstrap_process(),
+      Err(Error::AlreadyInitialized)
+    );
+  }
+
+  #[test]
+  fn dispatch_001_context_pointer_requires_execution() {
+    let mut state = KernelState::new();
+    state.initialize_scheduler(0b1111).unwrap();
+    let mut process = Process::new(
+      ObjectId::from_raw_parts(90, 1),
+      state.bootstrap_space(),
+      ProcessLimits::new(4, 4, 8, 8).unwrap(),
+    );
+    process.start().unwrap();
+    let process = state
+      .insert_test_object(KernelObject::Process(process))
+      .unwrap();
+    let thread = state
+      .insert_test_object(KernelObject::Thread(Thread::new(process, 1, 8).unwrap()))
+      .unwrap();
+    assert!(matches!(
+      state.thread_context_pointer(thread),
+      Err(Error::Thread(thread::Error::ExecutionMissing))
+    ));
+  }
+
+  #[test]
+  fn dispatch_002_dispatch_exposes_owned_context() {
+    let mut state = KernelState::new();
+    let (_, thread) = scheduler_state(&mut state);
+    state.wake_thread(thread).unwrap();
+    assert_eq!(state.dispatch_next(0), Ok(Some(thread)));
+    assert!(!state.thread_context_pointer(thread).unwrap().is_null());
   }
 
   #[test]

@@ -1,3 +1,7 @@
+#[cfg(target_arch = "riscv64")]
+use crate::platform::MAX_HARTS;
+#[cfg(target_arch = "riscv64")]
+use core::cell::UnsafeCell;
 use core::mem::{offset_of, size_of};
 
 #[cfg(target_arch = "riscv64")]
@@ -15,6 +19,7 @@ pub const SMOKE_STACK_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+  InvalidHartIndex,
   InvalidEntry,
   InvalidStackTop,
   HartLocalChanged,
@@ -24,6 +29,7 @@ pub enum Error {
 impl Error {
   pub const fn as_str(self) -> &'static str {
     match self {
+      Self::InvalidHartIndex => "invalid scheduler context hart index",
       Self::InvalidEntry => "context entry address is invalid",
       Self::InvalidStackTop => "context stack top is invalid",
       Self::HartLocalChanged => "context switch changed the hart-local identity",
@@ -69,6 +75,38 @@ const _: () = {
   assert!(offset_of!(SavedContext, sp) == size_of::<usize>());
   assert!(offset_of!(SavedContext, s) == 2 * size_of::<usize>());
 };
+
+#[cfg(target_arch = "riscv64")]
+struct SchedulerContexts([UnsafeCell<SavedContext>; MAX_HARTS]);
+
+#[cfg(target_arch = "riscv64")]
+// SAFETY: each slot is mutated only by the hart with the matching dense index.
+unsafe impl Sync for SchedulerContexts {}
+
+#[cfg(target_arch = "riscv64")]
+static SCHEDULER_CONTEXTS: SchedulerContexts =
+  SchedulerContexts([const { UnsafeCell::new(SavedContext::empty()) }; MAX_HARTS]);
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn scheduler_context(hart: usize) -> Result<*mut SavedContext, Error> {
+  SCHEDULER_CONTEXTS
+    .0
+    .get(hart)
+    .map(UnsafeCell::get)
+    .ok_or(Error::InvalidHartIndex)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) unsafe fn switch_saved_context(
+  outgoing: *mut SavedContext,
+  incoming: *const SavedContext,
+) {
+  assert!(!outgoing.is_null(), "outgoing context pointer is null");
+  assert!(!incoming.is_null(), "incoming context pointer is null");
+  assert_ne!(outgoing.cast_const(), incoming, "context pointers alias");
+  // SAFETY: the caller guarantees exclusive outgoing access and a live incoming context.
+  unsafe { switch_context(outgoing, incoming) };
+}
 
 #[cfg(target_arch = "riscv64")]
 unsafe extern "C" {

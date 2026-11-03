@@ -9,6 +9,7 @@ use crate::arch::riscv64::{
 };
 use crate::dtb::Dtb;
 use crate::kernel_state;
+use crate::kernel_thread;
 use crate::memory::EarlyFrameAllocator;
 use crate::memory::address_space;
 use crate::memory::{frame_allocator, kernel_stack};
@@ -103,6 +104,37 @@ pub fn run(hart_id: usize, dtb_address: usize) -> ! {
 
   context::run_boot_smoke_test().unwrap_or_else(|error| fail("Context Switch", error.as_str()));
   report::context_switch();
+
+  let process = kernel_state::initialize_bootstrap_process()
+    .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  kernel_thread::reset_smoke_state();
+  let affinity = 1u64
+    .checked_shl(boot_index as u32)
+    .unwrap_or_else(|| fail("Kernel Thread", "invalid boot hart affinity"));
+  let thread = kernel_state::create_thread(
+    kernel_state::bootstrap_space(),
+    process.authority,
+    affinity,
+    crate::thread::MIN_PRIORITY,
+    kernel_thread::smoke_entry_address(),
+  )
+  .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  let wake = kernel_state::wake_thread(thread.object)
+    .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  if wake.target_hart != boot_index {
+    fail("Kernel Thread", "smoke Thread selected a remote hart");
+  }
+  let dispatched = kernel_state::dispatch_current_hart_once()
+    .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  if dispatched != Some(thread.object) || !kernel_thread::smoke_entered() {
+    fail("Kernel Thread", "smoke Thread did not execute");
+  }
+  let (_, runnable, running) = kernel_state::global_scheduler_summary()
+    .unwrap_or_else(|error| fail("Kernel Thread", error.as_str()));
+  if runnable != 0 || running != 0 {
+    fail("Kernel Thread", "smoke Thread did not park cleanly");
+  }
+  report::kernel_thread(thread.object, process.object, affinity);
 
   report::complete();
   cpu::idle()

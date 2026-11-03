@@ -89,6 +89,20 @@ pub fn context_switch() {
   );
 }
 
+pub fn kernel_thread(
+  thread: crate::object::ObjectId,
+  process: crate::object::ObjectId,
+  affinity: u64,
+) {
+  section("Kernel Thread Dispatch");
+  usize_field("Process identity", process.into_raw());
+  usize_field("Thread identity", thread.into_raw());
+  u64_field("Affinity", affinity);
+  console::write_line("  Entry executed    : yes");
+  console::write_line("  Final state       : blocked");
+  console::write_line("  Boot context      : restored");
+}
+
 pub fn runtime_memory(free_frames: usize, stack_top: usize) {
   section("Runtime Memory");
   usize_field("Free frames", free_frames);
